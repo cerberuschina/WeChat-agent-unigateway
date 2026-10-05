@@ -34,19 +34,53 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent_gateway import ilink  # noqa: E402
 
 PLACEHOLDER = "{text}"
+SESSION_PLACEHOLDER = "{session}"
+SESSION_MARK = "##SESSION:"
 
 
 def log(message: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
 
 
-def run_agent(argv: list[str], text: str, *, use_stdin: bool, timeout: float, cwd: str) -> str:
+def extract_session(answer: str) -> tuple[str, str]:
+    """Pull a runner's ``##SESSION:<id>`` marker out of its output.
+
+    A runner that supports multi-turn work prints the marker so the next message
+    from the same peer can resume that conversation instead of starting cold.
+    """
+    session = ""
+    kept: list[str] = []
+    for line in answer.splitlines():
+        if line.strip().startswith(SESSION_MARK):
+            session = line.strip()[len(SESSION_MARK):].strip()
+        else:
+            kept.append(line)
+    return "\n".join(kept).strip(), session
+
+
+def load_sessions(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_sessions(path: Path, sessions: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(sessions, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def run_agent(argv: list[str], text: str, *, use_stdin: bool, timeout: float, cwd: str,
+              session: str = "") -> str:
     """Run the agent command once and return its answer."""
     if use_stdin:
         command = argv
         stdin = text
     else:
-        command = [text if part == PLACEHOLDER else part for part in argv]
+        command = [text if part == PLACEHOLDER else session if part == SESSION_PLACEHOLDER else part
+                   for part in argv]
         if command == argv and PLACEHOLDER not in argv:
             command = argv + [text]          # no placeholder: append the text
         stdin = None
@@ -124,6 +158,9 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=900.0, help="per-message timeout (seconds)")
     parser.add_argument("--max-chars", type=int, default=1200, help="split answers longer than this")
     parser.add_argument("--creds", default="", help="where to keep the virtual identity")
+    parser.add_argument("--session-store", default="",
+                        help="where to keep per-peer session ids (default: next to --creds); "
+                             "use {session} in --runner to resume the conversation")
     parser.add_argument("--login-only", action="store_true")
     parser.add_argument("--once", action="store_true", help="handle a single message then exit")
     parser.add_argument("--max-refreshes", type=int, default=30)
@@ -173,6 +210,9 @@ def main(argv: list | None = None) -> int:
     # posix-style splitting ("C:\x\y" -> "C:xy"), so normalise them to slashes.
     runner = shlex.split(args.runner.replace("\\", "/"))
     log(f"用命令处理消息：{' '.join(runner)}" + ("  (stdin)" if args.stdin else ""))
+    sessions_path = (Path(args.session_store) if args.session_store
+                     else creds_path.with_suffix(".sessions.json"))
+    sessions = load_sessions(sessions_path)
 
     cursor = str(creds.get("cursor") or "")
     handled = 0
@@ -204,13 +244,19 @@ def main(argv: list | None = None) -> int:
                 continue
             log(f"← {sender}: {text[:80]}")
             started = time.time()
+            session = sessions.get(sender, "")
             try:
-                answer = run_agent(runner, text, use_stdin=args.stdin,
-                                   timeout=args.timeout, cwd=args.cwd)
+                answer = run_agent(runner, text, use_stdin=args.stdin, timeout=args.timeout,
+                                   cwd=args.cwd, session=session)
             except subprocess.TimeoutExpired:
                 answer = f"（跑了 {args.timeout:.0f} 秒还没完，这次先放弃）"
             except Exception as exc:  # noqa: BLE001 - the agent must never kill the loop
                 answer = f"（跑挂了：{exc}）"
+            answer, new_session = extract_session(answer)
+            if new_session and new_session != session:
+                sessions[sender] = new_session
+                save_sessions(sessions_path, sessions)
+                log(f"（会话已记下，下一条接着聊：{new_session[:8]}…）")
             if not answer.strip():
                 answer = "（这次没有输出）"
             log(f"→ {answer[:80]}（{time.time() - started:.1f}s）")

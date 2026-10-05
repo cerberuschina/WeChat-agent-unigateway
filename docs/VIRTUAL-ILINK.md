@@ -98,7 +98,18 @@ python clients/ilink_agent_client.py --name claude \
 | `--once` | 处理一条就退出（测试用） |
 | `--timeout` | 单条消息的处理上限（默认 900s） |
 | `--creds` | 虚拟身份与游标存哪儿（默认 `data/virtual-client-<name>.json`） |
+| `--session-store` | 每个联系人一条会话线（默认存在凭证旁边），配合 `{session}` 做多轮 |
 | `--reuse-token` | 直接用已经持有的真 token（对应上面的情况 A） |
+
+**多轮任务怎么接着聊**：runner 只要在输出里打印一行 `##SESSION:<id>`，客户端会把这行
+从回复里摘掉、按联系人存下来，下一次用 `{session}` 传回去：
+
+```bash
+--runner "claude -p {text} --resume {session}"
+```
+
+不这么做的话，每条消息都是**全新会话**——你说"开始 T2"，它不知道 T2 是什么
+（第一版就是这样：`--max-turns 1 --allowed Read`，任务类消息还会因为一轮用光而空手而归）。
 
 实测过的完整链路（Claude Code 作答 2.6 秒）：
 

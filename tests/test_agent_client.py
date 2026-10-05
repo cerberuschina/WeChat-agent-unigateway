@@ -59,6 +59,39 @@ class RunnerTests(unittest.TestCase):
                              "x", use_stdin=False, timeout=1, cwd="")
 
 
+class SessionTests(unittest.TestCase):
+    """A runner can keep one conversation per peer via the ##SESSION: marker."""
+
+    def test_marker_is_stripped_and_returned(self):
+        answer, session = client.extract_session("好的，我看下\n##SESSION:abc-123\n")
+        self.assertEqual(answer, "好的，我看下")
+        self.assertEqual(session, "abc-123")
+
+    def test_output_without_a_marker_is_untouched(self):
+        answer, session = client.extract_session("没有标记")
+        self.assertEqual(answer, "没有标记")
+        self.assertEqual(session, "")
+
+    def test_session_is_substituted_into_the_command(self):
+        answer = client.run_agent(
+            [PY, "-c", "import sys; print(sys.argv[1] or '(空)')", "{session}"],
+            "x", use_stdin=False, timeout=30, cwd="", session="sess-9")
+        self.assertEqual(answer, "sess-9")
+
+    def test_empty_session_still_produces_one_argument(self):
+        answer = client.run_agent(
+            [PY, "-c", "import sys; print(len(sys.argv), repr(sys.argv[1]))", "{session}"],
+            "x", use_stdin=False, timeout=30, cwd="", session="")
+        self.assertEqual(answer, "2 ''")
+
+    def test_sessions_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.json"
+            client.save_sessions(path, {"peer-a": "sess-1"})
+            self.assertEqual(client.load_sessions(path), {"peer-a": "sess-1"})
+            self.assertEqual(client.load_sessions(Path(tmp) / "missing.json"), {})
+
+
 class CredsTests(unittest.TestCase):
     def test_creds_round_trip_keeps_the_cursor(self):
         with tempfile.TemporaryDirectory() as tmp:
