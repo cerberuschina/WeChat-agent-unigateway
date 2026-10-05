@@ -45,11 +45,16 @@
 配一行就行：
 
 ```jsonc
-"virtual": { "enabled": true, "reuse_real_token_for": "hermes" }
+"virtual": {
+  "enabled": true,
+  "reuse_real_token_for": "hermes",
+  "reuse_token_env": "HERMES_WEIXIN_TOKEN"   // 或者 reuse_token_file: "C:/path/token.txt"
+}
 ```
 
 网关会**沿用那个真 token**：agent 那边什么都不用动（连 token 都不用重取），
-只要把它的微信 base_url 指过来。
+只要把它的微信 base_url 指过来。token 本身不写进配置——从环境变量或文件读；
+两个都不给时退回"网关自己那个 token"（只有 agent 与网关共用同一个 bot 身份时才正确）。
 
 > ⚠️ 实测过的坑：Hermes 的 `gateway/platforms/weixin.py` 里，
 > **消息收发**用的是可覆盖的 `base_url`（`WEIXIN_BASE_URL` 环境变量），
@@ -74,6 +79,37 @@ agent 拿到的身份形状与真的一模一样：
 `baseurl`（指向网关自己）。它之后 `getupdates` / `sendmessage` 全程以为在跟微信说话。
 
 想亲眼看一遍：`python examples/virtual_loop_demo.py`
+
+### agent 侧：用现成的客户端（起步最快）
+
+`clients/ilink_agent_client.py` 就是一个**普通的 iLink 客户端**：扫码拿虚拟号 →
+长轮询 → 每条消息跑一条命令 → 把命令的输出发回去。
+
+```bash
+python clients/ilink_agent_client.py --name claude \
+    --base-url http://127.0.0.1:18500 \
+    --runner "claude -p {text}" --cwd K:/ClaudeWork
+```
+
+| 参数 | 作用 |
+|---|---|
+| `--runner` | 命令模板；`{text}` 替换成消息内容（作为**一个**参数，不怕引号/换行） |
+| `--stdin` | 改成把消息喂给命令的标准输入 |
+| `--once` | 处理一条就退出（测试用） |
+| `--timeout` | 单条消息的处理上限（默认 900s） |
+| `--creds` | 虚拟身份与游标存哪儿（默认 `data/virtual-client-<name>.json`） |
+| `--reuse-token` | 直接用已经持有的真 token（对应上面的情况 A） |
+
+实测过的完整链路（Claude Code 作答 2.6 秒）：
+
+```
+真微信 ─► 网关 ─► 虚拟队列 ─► 客户端长轮询 ─► claude -p ─► sendmessage ─► 网关 ─► 真微信
+```
+
+游标跟着凭证落盘，重启不重放旧消息；身份失效（网关重启过）会自动重新扫码。
+
+> 写测试脚本时注意：网关的去重是**跨重启**的——同一条测试消息（同 message_id 或同内容）
+> 第二次会被当成重复丢掉。每次换个 message_id，或者清掉 data_dir。
 
 > **另一种（不推荐）做法**：hosts 文件把 `ilinkai.weixin.qq.com` 指到 127.0.0.1，
 > 再给本机装一张自签证书做 TLS 中间人。它能"无配置"拦截所有客户端，但：

@@ -102,9 +102,30 @@ class VirtualConfig:
     # needed because some clients hard-wire their QR-login URL to Tencent, so
     # they cannot re-bind through us — only reuse the binding they have.
     reuse_real_token_for: str = ""
+    # ...and where that agent's existing token comes from. Leave both empty to
+    # fall back to the gateway's own binding (only correct when the agent shares
+    # the gateway's bot identity).
+    reuse_token_env: str = ""
+    reuse_token_file: str = ""
 
     def approves(self, name: str) -> bool:
         return (name or "").lower() in [n.lower() for n in self.auto_approve]
+
+    def reuse_tokens(self, own_token: str = "") -> Dict[str, str]:
+        """token -> agent name: which already-issued tokens the virtual server accepts."""
+        if not self.reuse_real_token_for:
+            return {}
+        import os  # local: keeps this module dependency-free at import time
+
+        token = os.environ.get(self.reuse_token_env, "").strip() if self.reuse_token_env else ""
+        if not token and self.reuse_token_file:
+            try:
+                token = Path(self.reuse_token_file).expanduser().read_text(encoding="utf-8").strip()
+            except OSError:
+                token = ""
+        if not token:
+            token = (own_token or "").strip()
+        return {token: self.reuse_real_token_for} if token else {}
 
 
 @dataclass
@@ -202,6 +223,8 @@ def load_config(path: str | os.PathLike[str]) -> Config:
         port=int(virtual_raw.get("port") or 18500),
         auto_approve=[str(n) for n in (virtual_raw.get("auto_approve") or [])],
         reuse_real_token_for=str(virtual_raw.get("reuse_real_token_for") or "").lower(),
+        reuse_token_env=str(virtual_raw.get("reuse_token_env") or ""),
+        reuse_token_file=str(virtual_raw.get("reuse_token_file") or ""),
     )
     if virtual.reuse_real_token_for and virtual.reuse_real_token_for not in agents:
         raise ConfigError(

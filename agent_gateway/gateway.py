@@ -275,7 +275,7 @@ class Gateway:
             port=self.cfg.virtual.port,
             data_dir=self.cfg.data_dir / "virtual",
             auto_approve=self.cfg.virtual.auto_approve,
-            accept_tokens={self.cfg.account.token: reused} if reused else None,
+            accept_tokens=self.cfg.virtual.reuse_tokens(self.cfg.account.token),
             on_outbound=self._forward_to_wechat,
             on_log=log.info,
         )
