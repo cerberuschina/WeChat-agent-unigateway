@@ -65,7 +65,7 @@ class AgentConfig:
 
 @dataclass
 class DeliveryConfig:
-    max_chars_per_message: int = 1200
+    max_chars_per_message: int = 1800
     ack: bool = True
     ack_template: str = "已转给 {label}，算完就回。"
     error_template: str = "「{label}」这次没跑通：{error}"

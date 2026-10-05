@@ -51,7 +51,7 @@
   },
 
   "delivery": {
-    "max_chars_per_message": 1200,
+    "max_chars_per_message": 1800,
     "ack": true,
     "ack_template": "已转给 {label}，算完就回。",
     "error_template": "「{label}」这次没跑通：{error}",

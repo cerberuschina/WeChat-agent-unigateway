@@ -26,6 +26,7 @@ import json
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -96,6 +97,44 @@ def run_agent(argv: list[str], text: str, *, use_stdin: bool, timeout: float, cw
     return out
 
 
+def run_with_progress(runner: list[str], text: str, args, session: str, sender: str,
+                      client, message: dict) -> str:
+    """Run the agent while telling the peer it is still alive.
+
+    WeChat cannot edit a sent message, so "streaming" here means: the gateway
+    keeps the typing indicator on, and we post a short progress note every
+    ``--progress-every`` seconds until the answer exists.
+    """
+    holder: dict = {}
+
+    def work() -> None:
+        try:
+            holder["answer"] = run_agent(runner, text, use_stdin=args.stdin,
+                                         timeout=args.timeout, cwd=args.cwd, session=session)
+        except subprocess.TimeoutExpired:
+            holder["answer"] = f"（跑了 {args.timeout:.0f} 秒还没完，这次先放弃）"
+        except Exception as exc:  # noqa: BLE001 - the agent must never kill the loop
+            holder["answer"] = f"（跑挂了：{exc}）"
+
+    worker = threading.Thread(target=work, name="runner", daemon=True)
+    started = time.time()
+    worker.start()
+    every = max(float(args.progress_every), 0.0)
+    while worker.is_alive():
+        worker.join(timeout=every or 5.0)
+        if not worker.is_alive() or not every:
+            continue
+        elapsed = time.time() - started
+        note = f"⏳ 还在跑（已 {int(elapsed // 60)} 分 {int(elapsed % 60):02d} 秒），完事我把结果发上来。"
+        try:
+            client.send_text(sender, note, context_token=message.get("context_token"))
+        except ilink.ILinkError as exc:
+            log(f"（进度发不出去：{exc}）")
+        except Exception as exc:  # noqa: BLE001
+            log(f"（进度发不出去：{exc}）")
+    return holder.get("answer", "（没有结果）")
+
+
 def do_login(base_url: str, name: str, *, png: str = "", max_refreshes: int = 30,
              timeout: int = 480) -> dict:
     def on_event(kind: str, payload: dict) -> None:
@@ -155,8 +194,12 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--runner", default="", help=f"command template, e.g. 'claude -p {PLACEHOLDER}'")
     parser.add_argument("--stdin", action="store_true", help="pipe the message into the command instead")
     parser.add_argument("--cwd", default="", help="working directory for the agent command")
-    parser.add_argument("--timeout", type=float, default=900.0, help="per-message timeout (seconds)")
-    parser.add_argument("--max-chars", type=int, default=1200, help="split answers longer than this")
+    parser.add_argument("--timeout", type=float, default=3600.0,
+                        help="per-message timeout (seconds); a long agent run must not be cut short")
+    parser.add_argument("--max-chars", type=int, default=0,
+                        help="0 = send the answer whole and let the gateway render/split for WeChat")
+    parser.add_argument("--progress-every", type=float, default=45.0,
+                        help="while the agent works, post a 「还在跑」 note every N seconds (0 = off)")
     parser.add_argument("--creds", default="", help="where to keep the virtual identity")
     parser.add_argument("--session-store", default="",
                         help="where to keep per-peer session ids (default: next to --creds); "
@@ -245,13 +288,7 @@ def main(argv: list | None = None) -> int:
             log(f"← {sender}: {text[:80]}")
             started = time.time()
             session = sessions.get(sender, "")
-            try:
-                answer = run_agent(runner, text, use_stdin=args.stdin, timeout=args.timeout,
-                                   cwd=args.cwd, session=session)
-            except subprocess.TimeoutExpired:
-                answer = f"（跑了 {args.timeout:.0f} 秒还没完，这次先放弃）"
-            except Exception as exc:  # noqa: BLE001 - the agent must never kill the loop
-                answer = f"（跑挂了：{exc}）"
+            answer = run_with_progress(runner, text, args, session, sender, client, message)
             answer, new_session = extract_session(answer)
             if new_session and new_session != session:
                 sessions[sender] = new_session
@@ -260,7 +297,10 @@ def main(argv: list | None = None) -> int:
             if not answer.strip():
                 answer = "（这次没有输出）"
             log(f"→ {answer[:80]}（{time.time() - started:.1f}s）")
-            for chunk in ilink.split_text(answer, args.max_chars):
+            # 0 = hand the whole answer to the gateway, which renders Markdown for
+            # WeChat and splits it into bubbles (it knows the channel's limits).
+            chunks = [answer] if args.max_chars <= 0 else ilink.split_text(answer, args.max_chars)
+            for chunk in chunks:
                 client.send_text(sender, chunk, context_token=message.get("context_token"))
             handled += 1
             if args.once:

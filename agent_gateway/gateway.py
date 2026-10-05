@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Optional
 
-from . import backends, ilink, router
+from . import backends, ilink, markdown, router
 from .config import Config, ConfigError, load_account, load_config, save_account
 from .store import StateStore
 from .virtual_ilink import VirtualILinkServer
@@ -50,6 +50,7 @@ class Gateway:
         self._stop = threading.Event()
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="agent")
         self._typing_tickets: Dict[str, str] = {}
+        self._typing_loops: Dict[str, threading.Event] = {}
         self.virtual: Optional[VirtualILinkServer] = None
 
     # -- account ---------------------------------------------------------
@@ -108,7 +109,10 @@ class Gateway:
             print(f"[dry-run] -> {_safe(chat_id)}: {text}")
             return
         context_token = self.client.context_token(chat_id)
-        for chunk in ilink.split_text(text, self.cfg.delivery.max_chars_per_message):
+        # WeChat renders no Markdown and refuses oversized items, so rendering and
+        # splitting belong to the channel layer — the agent sends what it means.
+        chunks = markdown.prepare(text, self.cfg.delivery.max_chars_per_message)
+        for chunk in chunks:
             try:
                 self.client.send_text(chat_id, chunk, context_token=context_token)
             except ilink.SessionExpired:
@@ -141,6 +145,37 @@ class Gateway:
                                     context_token=self.client.context_token(chat_id))
         except ilink.ILinkError:
             pass
+
+    def _start_typing(self, chat_id: str, *, max_seconds: float = 1800.0) -> None:
+        """Keep 「正在输入」 alive while a virtual agent works.
+
+        WeChat cannot edit a sent message (the real adapter sets
+        ``SUPPORTS_MESSAGE_EDITING = False``), so there is no true streaming on
+        this channel. What we can honestly do is hold the typing indicator for
+        the whole run and let the agent send its own progress notes.
+        """
+        if self.dry_run or self.client is None:
+            return
+        self._stop_typing(chat_id, quiet=True)
+        stop = threading.Event()
+        self._typing_loops[chat_id] = stop
+        deadline = time.monotonic() + max_seconds
+
+        def loop() -> None:
+            while not stop.is_set() and time.monotonic() < deadline:
+                self._typing(chat_id, ilink.TYPING_START)
+                stop.wait(45.0)
+            self._typing(chat_id, ilink.TYPING_STOP)
+
+        threading.Thread(target=loop, name=f"typing-{chat_id[-6:]}", daemon=True).start()
+
+    def _stop_typing(self, chat_id: str, *, quiet: bool = False) -> None:
+        stop = self._typing_loops.pop(chat_id, None)
+        if stop is None:
+            return
+        stop.set()
+        if not quiet:
+            self._typing(chat_id, ilink.TYPING_STOP)
 
     # -- message handling ------------------------------------------------
     def handle(self, message: dict) -> None:
@@ -227,6 +262,8 @@ class Gateway:
             return
         if self.cfg.delivery.ack and not self.dry_run:
             self._send(sender, self.cfg.delivery.ack_template.format(label=agent.display))
+        # The agent answers whenever it is done; hold 「正在输入」 until then.
+        self._start_typing(sender)
 
     # -- poll loop -------------------------------------------------------
     def run(self, *, once: bool = False) -> int:
@@ -298,6 +335,7 @@ class Gateway:
         if not peer:
             log.warning("virtual agent %s answered %r before any peer was known", bind.name, text[:60])
             return
+        self._stop_typing(peer)
         log.info("virtual: %s -> wechat %s (%d chars)", bind.name, _safe(peer), len(text))
         self._send(peer, text)
 
