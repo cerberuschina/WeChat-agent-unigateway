@@ -118,6 +118,23 @@ python clients/ilink_agent_client.py --name claude \
 微信**不支持编辑已发出的消息**（真适配器里写着 `SUPPORTS_MESSAGE_EDITING = False`），
 所以做不到逐字流式；能保证的是「有反馈、不丢结果」。
 
+**轮数不设限**：runner 默认**不带** `--max-turns`（= Claude Code 自身的默认，不限轮数），
+可读范围也只受 cwd 约束。想自保可以自己加 `--max-turns N`。
+
+**上下文自曝**：runner 在答复末尾附一行状态，例：
+
+```
+〔claude-opus-5-5[1m] · 上下文 109,578 / 1,000,000（10%） · 6 轮 · $0.1400〕
+```
+
+数字取自 CLI 自己报的 `usage`（`input_tokens + cache_read + cache_creation` = 这次请求的
+上下文占用）与 `modelUsage.<model>.contextWindow`——**不写死 200k**，型号不同窗口不同。
+用到 75% 以上会多给一句提醒。任何 runner 都能照这个约定在末尾加一行状态，客户端原样带回去。
+
+**注意 agent 的视野**：Claude Code 只能读它 cwd 里的东西——跑在 `K:\ClaudeWork` 时，
+`K:\hermesWork` 的文件它读不了（会被沙箱拦下，实测如此）。要让它看别的项目，把 runner 的
+`--cwd` 指过去，或者按前缀给不同项目各起一个客户端（`/c` 走这边、`/p` 走那边）。
+
 **Markdown 谁渲染**：网关。agent 直接发 Markdown 就行，网关在发送前把它渲染成微信
 能读的样子：`**粗**`→`粗`、标题→`【标题】`、表格去掉虚线行、链接保留地址、
 **代码块原样保留**；再按 1800 字上限在段落边界切条，代码围栏不会被切一半
