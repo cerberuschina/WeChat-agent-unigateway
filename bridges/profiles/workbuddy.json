@@ -1,0 +1,25 @@
+{
+  "_comment": "WorkBuddy Desktop (Electron) 的选择器档案。选择器要在你自己的机器上对着实际界面调一次；--list 可以看有哪些窗口。",
+
+  "description": "WorkBuddy Desktop —— 用 CDP 把它当 gateway 的一个后端",
+  "port": 9222,
+  "target_match": "workbuddy",
+  "timeout": 600,
+  "settle_seconds": 1.5,
+
+  "composer_selector": "textarea, [contenteditable='true']",
+  "send_selector": "",
+  "message_selector": "[class*='message'], [data-testid*='message']",
+  "busy_selector": "[class*='generating'], [class*='loading']",
+
+  "_HOWTO": [
+    "1) 关掉 WorkBuddy，然后带调试端口重启：",
+    "   \"D:\\Program Files\\WorkBuddy\\WorkBuddy.exe\" --remote-debugging-port=9222",
+    "2) python bridges/electron_cdp.py --profile bridges/profiles/workbuddy.json --list",
+    "   看 target 列表，把 target_match 改成能匹配聊天窗口的那一段（标题或 URL 都行）",
+    "3) 打开一次开发者工具（Ctrl+Shift+I）→ 右键输入框 → 检查，把真实选择器填进 composer_selector；",
+    "   同理确认 message_selector（每条消息的容器）与 busy_selector（生成中的指示元素）",
+    "4) 测一发：python bridges/electron_cdp.py --profile ... --text 你好",
+    "5) 通了之后把 gateway.json 的 workbuddy 段改成 exec 后端（见 docs/BACKENDS-WORKBUDDY.md）"
+  ]
+}

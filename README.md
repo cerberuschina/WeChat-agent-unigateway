@@ -122,11 +122,12 @@ python -m agent_gateway --config gateway.json
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -t .     # 65 项，全部离线（不联网、不碰微信）
+python -m unittest discover -s tests -t .     # 73 项，全部离线（不联网、不碰微信）
 ```
 
 测试覆盖：路由语法（含命令与 agent 前缀冲突）、A2A 回复提取、exec 后端（argv/stdin/超时/非零退出）、
-iLink 解析与错误映射、以及**干跑模式下的端到端**（一条微信消息从去重 → 路由 → 后端 → 回复）。
+iLink 解析与错误映射、**干跑模式下的端到端**（一条微信消息从去重 → 路由 → 后端 → 回复）、
+以及 CDP 桥的选择器档案与 JS 片段。
 
 ## 目录
 
@@ -138,8 +139,11 @@ agent_gateway/
   store.py     会话 sticky agent + 去重窗口
   gateway.py   主循环：收 → 路由 → 派发 → 回
 login.py       扫码绑定
-docs/PROTOCOL.md  iLink 协议要点（实测记录）
-tests/         离线测试
+bridges/       可选桥：bridges/electron_cdp.py 用 CDP 驱动只有桌面版的 agent
+docs/PROTOCOL.md            iLink 协议实测要点
+docs/BACKENDS-WORKBUDDY.md  WorkBuddy 实测结论 + 两条接法
+docs/SWITCH.md              把微信切到网关的步骤（含回滚）
+tests/         73 项离线测试
 ```
 
 ## 已知限制 / Roadmap
