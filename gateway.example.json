@@ -1,5 +1,5 @@
 {
-  "_comment": "agent-gateway 配置。复制成 gateway.json 再改。所有字段都有默认值，这里写的是最常见的本机形态。",
+  "_comment": "agent-gateway 配置。复制成 gateway.json 再改。这里演示【虚拟 iLink】接法：agent 只要把微信 base_url 指到本机网关（http://127.0.0.1:18500）就等于接上了微信，它自己零改动。",
 
   "account": {
     "account_id": "",
@@ -11,20 +11,23 @@
 
   "default_agent": "hermes",
 
+  "virtual": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 18500,
+    "auto_approve": ["hermes", "claude"]
+  },
+
   "agents": {
     "hermes": {
-      "type": "a2a",
+      "type": "virtual",
       "label": "Hermes",
-      "prefix": "h",
-      "url": "http://127.0.0.1:8800",
-      "timeout": 900
+      "prefix": "h"
     },
     "claude": {
-      "type": "a2a",
+      "type": "virtual",
       "label": "Claude Code",
-      "prefix": "c",
-      "url": "http://127.0.0.1:8799",
-      "timeout": 900
+      "prefix": "c"
     },
     "workbuddy": {
       "type": "exec",
@@ -34,6 +37,14 @@
       "command": ["workbuddy", "--prompt", "{text}"],
       "timeout": 600
     }
+  },
+
+  "_other_backend_types": {
+    "_comment": "不想用虚拟 iLink 时，把某个 agent 的 type 换成下面之一（三种可混用）。这类 agent 由网关主动去调，所以它不需要自己有微信接入能力。",
+    "a2a": { "type": "a2a", "url": "http://127.0.0.1:8800", "token": "", "timeout": 900 },
+    "http": { "type": "http", "url": "http://127.0.0.1:3000/chat",
+              "body_template": { "prompt": "{text}" }, "reply_path": "data.reply" },
+    "exec": { "type": "exec", "command": ["codebuddy", "-p", "{text}"], "timeout": 600 }
   },
 
   "delivery": {

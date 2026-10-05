@@ -30,6 +30,7 @@ from typing import Dict, Optional
 from . import backends, ilink, router
 from .config import Config, ConfigError, load_account, load_config, save_account
 from .store import StateStore
+from .virtual_ilink import VirtualILinkServer
 
 log = logging.getLogger("agent_gateway")
 
@@ -49,6 +50,7 @@ class Gateway:
         self._stop = threading.Event()
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="agent")
         self._typing_tickets: Dict[str, str] = {}
+        self.virtual: Optional[VirtualILinkServer] = None
 
     # -- account ---------------------------------------------------------
     def _resolve_account(self) -> bool:
@@ -182,6 +184,14 @@ class Gateway:
             self._send(sender, f"路由到了一个不存在的 agent：{decision.agent}")
             return
         log.info("dispatch -> %s (%s) from %s", agent.name, decision.note, _safe(sender))
+
+        # A "virtual" agent does not get called: it pulls its own messages with
+        # its own iLink long-poll (it thinks it is talking to WeChat). We just
+        # drop the message into its queue and wait for it to answer.
+        if agent.type == "virtual":
+            self._dispatch_virtual(agent, decision.text, sender, message_id, context_token)
+            return
+
         with self._chat_lock(sender):
             if self.cfg.delivery.ack and not self.dry_run:
                 self._send(sender, self.cfg.delivery.ack_template.format(label=agent.display))
@@ -203,6 +213,21 @@ class Gateway:
                 reply = f"「{agent.display}」没有返回任何内容。"
             self._send(sender, reply)
 
+    def _dispatch_virtual(self, agent, text: str, sender: str, message_id: str,
+                          context_token: str) -> None:
+        if not self.virtual:
+            self._send(sender, f"「{agent.display}」是虚拟接入的，但这个网关没开 virtual 模式"
+                               f"（gateway.json 的 virtual.enabled）。")
+            return
+        delivered = self.virtual.deliver(agent.name, text=text, peer=sender,
+                                        message_id=message_id, context_token=context_token)
+        if not delivered:
+            self._send(sender, f"「{agent.display}」还没接入：让它在自己那边发起一次微信扫码登录，"
+                               f"然后在这里批准 → {self.virtual.base_url()}/admin/binds")
+            return
+        if self.cfg.delivery.ack and not self.dry_run:
+            self._send(sender, self.cfg.delivery.ack_template.format(label=agent.display))
+
     # -- poll loop -------------------------------------------------------
     def run(self, *, once: bool = False) -> int:
         if not self._resolve_account():
@@ -214,6 +239,7 @@ class Gateway:
         log.info("gateway up: account=%s base=%s agents=%s",
                  _safe(self.client.account_id), self.client.base_url,
                  ",".join(a.name for a in self.cfg.enabled_agents()))
+        self._start_virtual()
         failures = 0
         while not self._stop.is_set():
             try:
@@ -239,6 +265,45 @@ class Gateway:
                 break
         return 0
 
+    # -- virtual iLink (agents connect to us, not to Tencent) -------------
+    def _start_virtual(self) -> None:
+        if not self.cfg.virtual.enabled:
+            return
+        self.virtual = VirtualILinkServer(
+            host=self.cfg.virtual.host,
+            port=self.cfg.virtual.port,
+            data_dir=self.cfg.data_dir / "virtual",
+            auto_approve=self.cfg.virtual.auto_approve,
+            on_outbound=self._forward_to_wechat,
+            on_log=log.info,
+        )
+        host, port = self.virtual.start()
+        # Pre-authorise the agents the operator listed in virtual.auto_approve:
+        # they get a virtual identity now, and pick up the credentials through
+        # their own QR login (which this server answers).
+        for name in self.cfg.virtual.auto_approve:
+            if not self.virtual.bind_named(name):
+                bind = self.virtual.request_bind(name)
+                self.virtual.approve(bind.qrcode, name=name)
+        print(f"\n虚拟 iLink 已就绪：{self.virtual.base_url()}")
+        print("  把 agent 的微信 base_url 指到这里，它就等于接上了微信（例：Hermes 用 WEIXIN_BASE_URL）")
+        print(f"  待批准的接入：http://{host}:{port}/admin/binds\n")
+        for agent in self.cfg.enabled_agents():
+            if agent.type != "virtual":
+                continue
+            bind = self.virtual.bind_named(agent.name)
+            state = f"已接入 {bind.account_id}" if bind else "还没接入（等它在自己那边发起扫码登录）"
+            print(f"  · {agent.name:<10} {state}")
+
+    def _forward_to_wechat(self, bind, text: str) -> None:
+        """A virtual agent answered: push it out through the real WeChat identity."""
+        peer = bind.last_peer
+        if not peer:
+            log.warning("virtual agent %s answered %r before any peer was known", bind.name, text[:60])
+            return
+        log.info("virtual: %s -> wechat %s (%d chars)", bind.name, _safe(peer), len(text))
+        self._send(peer, text)
+
     def _safe_handle(self, message: dict) -> None:
         try:
             self.handle(message)
@@ -251,6 +316,8 @@ class Gateway:
         self._stop.set()
 
     def shutdown(self) -> None:
+        if self.virtual:
+            self.virtual.stop()
         self._pool.shutdown(wait=False)
         self.store.flush()
 

@@ -84,6 +84,24 @@ class AccessConfig:
 
 
 @dataclass
+class VirtualConfig:
+    """The virtual iLink server: agents connect to *us* instead of Tencent.
+
+    ``enabled`` turns the local fake WeChat API on. ``auto_approve`` lists agent
+    names that may bind without an operator clicking approve (handy in tests,
+    and for an unattended machine).
+    """
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 18500
+    auto_approve: List[str] = field(default_factory=list)
+
+    def approves(self, name: str) -> bool:
+        return (name or "").lower() in [n.lower() for n in self.auto_approve]
+
+
+@dataclass
 class Config:
     account: AccountConfig
     agents: Dict[str, AgentConfig]
@@ -91,6 +109,7 @@ class Config:
     data_dir: Path = Path("data")
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     access: AccessConfig = field(default_factory=AccessConfig)
+    virtual: VirtualConfig = field(default_factory=VirtualConfig)
     source: Optional[Path] = None
 
     # -- lookups ---------------------------------------------------------
@@ -126,8 +145,9 @@ def _agent_from_dict(name: str, raw: Dict[str, Any]) -> AgentConfig:
     agent = AgentConfig(name=name.lower(), **raw)
     if agent.enabled and not agent.label:
         agent.label = name
-    if agent.enabled and agent.type not in {"a2a", "http", "exec"}:
-        raise ConfigError(f"agent '{name}': type must be a2a|http|exec, got {agent.type!r}")
+    if agent.enabled and agent.type not in {"a2a", "http", "exec", "virtual"}:
+        raise ConfigError(
+            f"agent '{name}': type must be a2a|http|exec|virtual, got {agent.type!r}")
     if agent.enabled and agent.type in {"a2a", "http"} and not agent.url:
         raise ConfigError(f"agent '{name}': type '{agent.type}' needs a url")
     if agent.enabled and agent.type == "exec" and not agent.command:
@@ -169,6 +189,14 @@ def load_config(path: str | os.PathLike[str]) -> Config:
     delivery = DeliveryConfig(**(raw.get("delivery") or {}))
     access = AccessConfig(allowed_users=[str(u) for u in (raw.get("access") or {}).get("allowed_users") or []])
 
+    virtual_raw = dict(raw.get("virtual") or {})
+    virtual = VirtualConfig(
+        enabled=bool(virtual_raw.get("enabled", False)),
+        host=str(virtual_raw.get("host") or "127.0.0.1"),
+        port=int(virtual_raw.get("port") or 18500),
+        auto_approve=[str(n) for n in (virtual_raw.get("auto_approve") or [])],
+    )
+
     cfg = Config(
         account=account,
         agents=agents,
@@ -176,12 +204,18 @@ def load_config(path: str | os.PathLike[str]) -> Config:
         data_dir=resolve(str(raw.get("data_dir") or "data")),
         delivery=delivery,
         access=access,
+        virtual=virtual,
         source=path,
     )
     if cfg.default_agent and cfg.default_agent not in cfg.agents:
         raise ConfigError(f"default_agent '{cfg.default_agent}' is not in agents")
     if not cfg.fallback_agent():
         raise ConfigError("no enabled agent to route to")
+    virtual_agents = [a.name for a in agents.values() if a.enabled and a.type == "virtual"]
+    if virtual_agents and not virtual.enabled:
+        raise ConfigError(
+            "agents " + ", ".join(virtual_agents) + " are type 'virtual' but "
+            "'virtual.enabled' is false — either enable it or change those agents' type")
     return cfg
 
 

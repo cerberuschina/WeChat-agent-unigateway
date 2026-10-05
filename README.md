@@ -32,6 +32,32 @@
 关键点：**同一个 bot 身份只能有一个进程在长轮询**。所以网关是那个唯一进程，
 后面的 agent 谁都不碰微信。
 
+## 两种接法
+
+**① 虚拟 iLink（推荐，agent 零改动）** —— 网关伪装成腾讯的 iLink 服务端，
+agent 照常扫码、照常长轮询，但对面是网关；网关给它一个**虚拟微信号**。
+
+```
+微信 ──► 网关（持有唯一真凭证）──► 虚拟 iLink 服务端 :18500
+                                      ▲            ▲
+                     WEIXIN_BASE_URL─┘            └─ base_url 指过来
+                     (Hermes 微信渠道)                (Claude / WorkBuddy 的微信接入)
+```
+
+Agent 那边什么都不用改，只要把微信的 base-url 指向 `http://127.0.0.1:18500`
+（Hermes 是环境变量 `WEIXIN_BASE_URL`）。详见 **[docs/VIRTUAL-ILINK.md](docs/VIRTUAL-ILINK.md)**。
+
+**② 直接后端（a2a / http / exec）** —— 网关主动去调 agent，等它返回。
+
+```
+微信 ──► 网关 ──┬─► A2A   http://127.0.0.1:8800
+                ├─► A2A   http://127.0.0.1:8799
+                └─► exec  某条命令行（stdout 就是回复）
+```
+
+想用哪种，取决于 agent 自己有什么：**有微信接入能力 → 用①；只有接口/命令行 → 用②。**
+两种可以混着配（`agents` 里每个 agent 的 `type` 决定）。
+
 ## 特点
 
 - **零依赖**：只用 Python 标准库（`urllib` + 线程），Python 3.9+ 直接跑。
@@ -127,28 +153,31 @@ python -m agent_gateway --config gateway.json
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -t .     # 73 项，全部离线（不联网、不碰微信）
+python -m unittest discover -s tests -t .     # 91 项，全部离线（不联网、不碰微信）
 ```
 
 测试覆盖：路由语法（含命令与 agent 前缀冲突）、A2A 回复提取、exec 后端（argv/stdin/超时/非零退出）、
-iLink 解析与错误映射、**干跑模式下的端到端**（一条微信消息从去重 → 路由 → 后端 → 回复）、
+iLink 解析与错误映射、**干跑模式下的端到端**（一条微信消息从去重 → 路由 → 后端/虚拟队列 → 回复）、
+**虚拟 iLink 的完整登录闭环**（HTTP 层：取码 → 待批准 → 批准 → 拿虚拟身份 → 带 token 调用）、
 以及 CDP 桥的选择器档案与 JS 片段。
 
 ## 目录
 
 ```
 agent_gateway/
-  ilink.py     iLink Bot API 客户端（长轮询 / 发送 / 二维码登录 / 游标与 context_token）
-  router.py    路由规则（纯函数，好测）
-  backends.py  a2a / http / exec 三种后端
-  store.py     会话 sticky agent + 去重窗口
-  gateway.py   主循环：收 → 路由 → 派发 → 回
-login.py       扫码绑定
-bridges/       可选桥：bridges/electron_cdp.py 用 CDP 驱动只有桌面版的 agent
+  ilink.py         真实 iLink 客户端（长轮询 / 发送 / 扫码 / 游标与 context_token）
+  virtual_ilink.py 虚拟 iLink 服务端（伪装成腾讯那侧，给 agent 发虚拟微信号）
+  router.py        路由规则（纯函数，好测）
+  backends.py      a2a / http / exec 三种直接后端
+  store.py         会话 sticky agent + 去重窗口
+  gateway.py       主循环：收 → 路由 → 派发（虚拟队列 或 直接后端）→ 回
+login.py           扫码绑定这个网关自己的真微信号
+bridges/           可选桥：bridges/electron_cdp.py 用 CDP 驱动只有桌面版的 agent
+docs/VIRTUAL-ILINK.md       虚拟 iLink 的设计、接法、批准流程、边界
 docs/PROTOCOL.md            iLink 协议实测要点
 docs/BACKENDS-WORKBUDDY.md  WorkBuddy 实测结论 + 两条接法
 docs/SWITCH.md              把微信切到网关的步骤（含回滚）
-tests/         73 项离线测试
+tests/             91 项离线测试
 ```
 
 ## 已知限制 / Roadmap
