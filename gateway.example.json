@@ -1,0 +1,50 @@
+{
+  "_comment": "agent-gateway 配置。复制成 gateway.json 再改。所有字段都有默认值，这里写的是最常见的本机形态。",
+
+  "account": {
+    "account_id": "",
+    "token": "",
+    "base_url": "https://ilinkai.weixin.qq.com"
+  },
+
+  "data_dir": "data",
+
+  "default_agent": "hermes",
+
+  "agents": {
+    "hermes": {
+      "type": "a2a",
+      "label": "Hermes",
+      "prefix": "h",
+      "url": "http://127.0.0.1:8800",
+      "timeout": 900
+    },
+    "claude": {
+      "type": "a2a",
+      "label": "Claude Code",
+      "prefix": "c",
+      "url": "http://127.0.0.1:8799",
+      "timeout": 900
+    },
+    "workbuddy": {
+      "type": "exec",
+      "label": "WorkBuddy",
+      "prefix": "w",
+      "enabled": false,
+      "command": ["workbuddy", "--prompt", "{text}"],
+      "timeout": 600
+    }
+  },
+
+  "delivery": {
+    "max_chars_per_message": 1200,
+    "ack": true,
+    "ack_template": "已转给 {label}，算完就回。",
+    "error_template": "「{label}」这次没跑通：{error}",
+    "queue_template": "队列里还有 {n} 条，按顺序回。"
+  },
+
+  "access": {
+    "allowed_users": []
+  }
+}
