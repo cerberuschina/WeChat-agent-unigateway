@@ -15,7 +15,10 @@
     "enabled": true,
     "host": "127.0.0.1",
     "port": 18500,
-    "auto_approve": ["hermes", "claude"]
+    "auto_approve": ["claude"],
+    "_auto_approve": "这些 agent 免人工批准：它们扫码时自动拿到网关签发的虚拟身份",
+    "reuse_real_token_for": "hermes",
+    "_reuse_real_token_for": "已经绑过真微信的 agent 写在这里：它连 token 都不用换，指过 base_url 就能用"
   },
 
   "agents": {

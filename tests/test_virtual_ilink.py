@@ -229,5 +229,92 @@ class WiringTests(unittest.TestCase):
             gateway.shutdown()
 
 
+class TokenReuseTests(unittest.TestCase):
+    """An agent already bound to the real WeChat keeps working through us.
+
+    Hermes' weixin channel reads WEIXIN_BASE_URL for its message calls, but its
+    QR-login URL is hard-wired to Tencent — so it cannot re-bind through the
+    gateway. It must be able to keep the token it holds.
+    """
+
+    REAL = "real-token-from-tenant"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.server = VirtualILinkServer(data_dir=Path(self._tmp.name), port=0,
+                                         accept_tokens={self.REAL: "hermes"})
+        self.host, self.port = self.server.start()
+        self.base = f"http://{self.host}:{self.port}"
+
+    def tearDown(self):
+        self.server.stop()
+        self._tmp.cleanup()
+
+    def test_real_token_resolves_to_a_named_virtual_identity(self):
+        bind = self.server._bind_for_token(self.REAL)
+        self.assertIsNotNone(bind)
+        self.assertEqual(bind.name, "hermes")
+        self.assertTrue(bind.confirmed)
+        self.assertEqual(self.server.agent_names(), ["hermes"])
+
+    def test_an_unknown_token_is_still_refused(self):
+        self.assertIsNone(self.server._bind_for_token("someone-elses-token"))
+        self.assertEqual(post(f"{self.base}/ilink/bot/sendtyping", {} , token="bogus")["ret"], -14)
+
+    def test_http_calls_with_the_real_token_are_served(self):
+        self.assertEqual(post(f"{self.base}/ilink/bot/sendtyping", {}, token=self.REAL)["ret"], 0)
+
+    def test_reuse_bind_is_never_handed_out_as_a_qr(self):
+        reuse = self.server._bind_for_token(self.REAL)
+        fresh = self.server.ep_qrcode()
+        self.assertNotEqual(fresh["qrcode"], reuse.qrcode,
+                            "复用真 token 的身份不能被别人扫码领走")
+
+    def test_messages_reach_the_reusing_agent_and_answers_come_back(self):
+        out = []
+        self.server.on_outbound = lambda bind, text: out.append((bind.name, text))
+        bind = self.server._bind_for_token(self.REAL)
+        self.server.deliver("hermes", text="在吗", peer="wx-owner", context_token="ctx")
+        _, messages = bind.drain("", 0.2)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(self.server.ep_sendmessage(bind, {"msg": {"item_list": [
+            {"type": 1, "text_item": {"text": "在"}}]}})["ret"], 0)
+        self.assertEqual(out, [("hermes", "在")])
+
+
+class ReuseWiringTests(unittest.TestCase):
+    def test_gateway_wires_the_real_token_into_the_virtual_server(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cfg.json"
+            path.write_text(json.dumps({
+                "data_dir": str(Path(tmp) / "data"),
+                "account": {"account_id": "acct", "token": "the-real-token"},
+                "default_agent": "hermes",
+                "virtual": {"enabled": True, "port": 0, "reuse_real_token_for": "hermes"},
+                "agents": {"hermes": {"type": "virtual", "label": "Hermes"}},
+            }, ensure_ascii=False), encoding="utf-8")
+            cfg = load_config(path)
+            gateway = Gateway(cfg, dry_run=True)
+            try:
+                gateway._start_virtual()
+                bind = gateway.virtual._bind_for_token("the-real-token")
+                self.assertIsNotNone(bind, "网关应当把真 token 交给虚拟层复用")
+                self.assertEqual(bind.name, "hermes")
+            finally:
+                gateway.shutdown()
+
+    def test_naming_an_unknown_agent_is_a_config_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cfg.json"
+            path.write_text(json.dumps({
+                "data_dir": str(Path(tmp) / "data"),
+                "virtual": {"enabled": True, "reuse_real_token_for": "nobody"},
+                "agents": {"hermes": {"type": "virtual"}},
+            }, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaises(ConfigError) as ctx:
+                load_config(path)
+            self.assertIn("reuse_real_token_for", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

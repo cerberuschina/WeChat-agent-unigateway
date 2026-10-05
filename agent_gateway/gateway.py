@@ -269,25 +269,22 @@ class Gateway:
     def _start_virtual(self) -> None:
         if not self.cfg.virtual.enabled:
             return
+        reused = self.cfg.virtual.reuse_real_token_for
         self.virtual = VirtualILinkServer(
             host=self.cfg.virtual.host,
             port=self.cfg.virtual.port,
             data_dir=self.cfg.data_dir / "virtual",
             auto_approve=self.cfg.virtual.auto_approve,
+            accept_tokens={self.cfg.account.token: reused} if reused else None,
             on_outbound=self._forward_to_wechat,
             on_log=log.info,
         )
         host, port = self.virtual.start()
-        # Pre-authorise the agents the operator listed in virtual.auto_approve:
-        # they get a virtual identity now, and pick up the credentials through
-        # their own QR login (which this server answers).
-        for name in self.cfg.virtual.auto_approve:
-            if not self.virtual.bind_named(name):
-                bind = self.virtual.request_bind(name)
-                self.virtual.approve(bind.qrcode, name=name)
         print(f"\n虚拟 iLink 已就绪：{self.virtual.base_url()}")
         print("  把 agent 的微信 base_url 指到这里，它就等于接上了微信（例：Hermes 用 WEIXIN_BASE_URL）")
         print(f"  待批准的接入：http://{host}:{port}/admin/binds\n")
+        if reused:
+            print(f"  已复用真 token 的 agent：{reused}（它原来的微信绑定不用改，直接指过来即可）\n")
         for agent in self.cfg.enabled_agents():
             if agent.type != "virtual":
                 continue

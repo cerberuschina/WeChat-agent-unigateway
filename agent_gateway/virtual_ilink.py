@@ -144,6 +144,7 @@ class VirtualILinkServer:
     def __init__(self, *, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                  data_dir: str | Path = "data/virtual",
                  auto_approve: Optional[List[str]] = None,
+                 accept_tokens: Optional[Dict[str, str]] = None,
                  on_outbound: Optional[Callable[[VirtualBind, str], None]] = None,
                  on_log: Optional[Callable[[str], None]] = None):
         self.host = host
@@ -151,6 +152,8 @@ class VirtualILinkServer:
         self.dir = Path(data_dir).expanduser()
         self.dir.mkdir(parents=True, exist_ok=True)
         self.auto_approve = [n.lower() for n in (auto_approve or [])]
+        # real token -> agent name (see config.VirtualConfig.reuse_real_token_for)
+        self.accept_tokens = {t: n for t, n in (accept_tokens or {}).items() if t and n}
         self.on_outbound = on_outbound
         self._log = on_log or (lambda _m: None)
         self._lock = threading.RLock()
@@ -190,7 +193,9 @@ class VirtualILinkServer:
             bind = self._binds.get(qrcode)
             if not bind:
                 return None
-            if name:
+            if name and name != bind.name:
+                # Re-minting on every approve would silently change the identity
+                # the agent already received, so only do it on a real rename.
                 bind.name = name
                 bind.account_id = virtual_account_id(name)
             if not bind.confirmed:
@@ -206,9 +211,37 @@ class VirtualILinkServer:
                 self._by_token.pop(bind.token, None)
             return bind is not None
 
+    def ensure_bind(self, name: str, *, issued: bool = True) -> VirtualBind:
+        """Get (or create) a confirmed identity for a named agent.
+
+        ``issued=True`` means "never hand this qrcode out to a fresh agent": used
+        for identities that are reserved for a specific client (auto-approved
+        agents and token-reuse agents).
+        """
+        bind = self.bind_named(name)
+        if bind:
+            return bind
+        bind = self.request_bind(name)
+        if not bind.confirmed:
+            self.approve(bind.qrcode, name=name)
+        bind.qr_issued = issued
+        return bind
+
     def _bind_for_token(self, token: str) -> Optional[VirtualBind]:
+        if not token:
+            return None
         with self._lock:
-            return self._by_token.get(token)
+            bind = self._by_token.get(token)
+        if bind:
+            return bind
+        name = self.accept_tokens.get(token)
+        if not name:
+            return None
+        # A client that is already bound to the real WeChat (its QR path may be
+        # hard-wired to Tencent) keeps working through us: the token it already
+        # holds is an alias for its virtual identity.
+        self._log(f"virtual: real token reused for agent {name}")
+        return self.ensure_bind(name, issued=True)
 
     # -- routing helpers -------------------------------------------------
     def deliver(self, agent: str, *, text: str, peer: str, message_id: str = "",
@@ -235,6 +268,14 @@ class VirtualILinkServer:
         self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
         self._httpd.daemon_threads = True
         self.port = self._httpd.server_address[1]
+        # Pre-authorise the listed agents: their identity exists from the start,
+        # and their own QR login picks up the credentials (see pending_qr).
+        # auto-approved agents may claim theirs through the QR flow; token-reuse
+        # agents must not, so their qrcode is never handed out.
+        for name in self.auto_approve:
+            self.ensure_bind(name, issued=False)
+        for name in self.accept_tokens.values():
+            self.ensure_bind(name, issued=True)
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="virtual-ilink",
                                         daemon=True)
         self._thread.start()

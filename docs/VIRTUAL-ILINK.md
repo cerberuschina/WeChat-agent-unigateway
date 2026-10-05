@@ -40,14 +40,40 @@
 
 ## 让 agent 连过来（不改它的代码）
 
-绝大多数客户端都认一个 base-url 覆盖：
+### 情况 A：它**已经绑过微信**（例如 Hermes 的 weixin 渠道）
+
+配一行就行：
+
+```jsonc
+"virtual": { "enabled": true, "reuse_real_token_for": "hermes" }
+```
+
+网关会**沿用那个真 token**：agent 那边什么都不用动（连 token 都不用重取），
+只要把它的微信 base_url 指过来。
+
+> ⚠️ 实测过的坑：Hermes 的 `gateway/platforms/weixin.py` 里，
+> **消息收发**用的是可覆盖的 `base_url`（`WEIXIN_BASE_URL` 环境变量），
+> 但**扫码登录那两步写死了 `ILINK_BASE_URL`**（取码 / 查状态都直接打腾讯）。
+> 所以它**没法重新扫一个"我们发的码"**——这种情况必须走 token 复用，
+> 而不是指望它扫我们的码。别的客户端也可能有同样的写死，先看它取码的 URL 从哪来。
+
+### 情况 B：它还没绑
+
+把它的微信 base_url 指到 `http://127.0.0.1:18500`，它就会**正常弹二维码**——
+只是这个码由网关签发（`qrcode_img_content` 指向 `/bind/<qrcode>`）。
 
 | agent | 怎么指过来 |
 |---|---|
-| Hermes（weixin 渠道） | 环境变量 `WEIXIN_BASE_URL=http://127.0.0.1:18500` |
-| 其他 iLink / ClawBot 风格客户端 | 同类 base-url / host 覆盖；有 `ilinkai.weixin.qq.com` 字样的配置就是它 |
+| Hermes（weixin 渠道，已绑定） | 环境变量 `WEIXIN_BASE_URL=http://127.0.0.1:18500` + `reuse_real_token_for` |
+| 其他 iLink / ClawBot 风格客户端 | 同类 base-url / host 覆盖；配置里有 `ilinkai.weixin.qq.com` 字样的就是它 |
 
-设好之后，agent 那边会**正常弹二维码**——只是这个码由网关签发。
+### 两种情况都会发生的事
+
+agent 拿到的身份形状与真的一模一样：
+`ilink_bot_id = virt-<name>xxxxxx@im.bot`、`bot_token`（网关签发）、
+`baseurl`（指向网关自己）。它之后 `getupdates` / `sendmessage` 全程以为在跟微信说话。
+
+想亲眼看一遍：`python examples/virtual_loop_demo.py`
 
 > **另一种（不推荐）做法**：hosts 文件把 `ilinkai.weixin.qq.com` 指到 127.0.0.1，
 > 再给本机装一张自签证书做 TLS 中间人。它能"无配置"拦截所有客户端，但：

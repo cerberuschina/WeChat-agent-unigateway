@@ -45,7 +45,15 @@ agent 照常扫码、照常长轮询，但对面是网关；网关给它一个**
 ```
 
 Agent 那边什么都不用改，只要把微信的 base-url 指向 `http://127.0.0.1:18500`
-（Hermes 是环境变量 `WEIXIN_BASE_URL`）。详见 **[docs/VIRTUAL-ILINK.md](docs/VIRTUAL-ILINK.md)**。
+（Hermes 是环境变量 `WEIXIN_BASE_URL`）。两种接入方式：
+
+- **它已经绑过微信**（Hermes 微信渠道就是这种：它的扫码 URL 写死在腾讯那边，没法重绑）：
+  配 `"virtual": {"reuse_real_token_for": "hermes"}`，它拿原来的 token 直接被网关接住。
+- **它还没绑**：它那边正常弹二维码 → 你在 `/bind/<qrcode>` 上批准 → 它拿到网关签发的
+  虚拟号；不想人工点就把它写进 `"auto_approve": ["claude"]`。
+
+想亲眼看一遍：`python examples/virtual_loop_demo.py`（真客户端 + 虚拟服务端，不联网）。
+详见 **[docs/VIRTUAL-ILINK.md](docs/VIRTUAL-ILINK.md)**。
 
 **② 直接后端（a2a / http / exec）** —— 网关主动去调 agent，等它返回。
 
@@ -153,12 +161,13 @@ python -m agent_gateway --config gateway.json
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -t .     # 91 项，全部离线（不联网、不碰微信）
+python -m unittest discover -s tests -t .     # 98 项，全部离线（不联网、不碰微信）
 ```
 
 测试覆盖：路由语法（含命令与 agent 前缀冲突）、A2A 回复提取、exec 后端（argv/stdin/超时/非零退出）、
 iLink 解析与错误映射、**干跑模式下的端到端**（一条微信消息从去重 → 路由 → 后端/虚拟队列 → 回复）、
 **虚拟 iLink 的完整登录闭环**（HTTP 层：取码 → 待批准 → 批准 → 拿虚拟身份 → 带 token 调用）、
+**真 token 复用**（已绑过的 agent 不改 token 就能被接住，且它的身份不会被别人扫码领走）、
 以及 CDP 桥的选择器档案与 JS 片段。
 
 ## 目录
@@ -172,12 +181,13 @@ agent_gateway/
   store.py         会话 sticky agent + 去重窗口
   gateway.py       主循环：收 → 路由 → 派发（虚拟队列 或 直接后端）→ 回
 login.py           扫码绑定这个网关自己的真微信号
+examples/virtual_loop_demo.py   一条命令跑完"虚拟 iLink"全流程（真客户端，不联网）
 bridges/           可选桥：bridges/electron_cdp.py 用 CDP 驱动只有桌面版的 agent
 docs/VIRTUAL-ILINK.md       虚拟 iLink 的设计、接法、批准流程、边界
 docs/PROTOCOL.md            iLink 协议实测要点
 docs/BACKENDS-WORKBUDDY.md  WorkBuddy 实测结论 + 两条接法
 docs/SWITCH.md              把微信切到网关的步骤（含回滚）
-tests/             91 项离线测试
+tests/             98 项离线测试
 ```
 
 ## 已知限制 / Roadmap
@@ -186,6 +196,8 @@ tests/             91 项离线测试
 - [ ] 群聊（取决于 iLink 是否给这个身份下发群事件）
 - [ ] 一条消息并发问多个 agent（`/all`）与结果汇总
 - [ ] WorkBuddy 之类的桌面应用适配（只有本地 API / 无 CLI 的场景）
+- [ ] 虚拟身份落盘：现在虚拟号只在内存里，网关重启后 agent 要重新扫码（它的 token 会收到
+      `ret=-14`，与真实 iLink 的失效行为一致）
 - [ ] 开机自启脚本（Windows Startup / systemd unit）
 
 ## License

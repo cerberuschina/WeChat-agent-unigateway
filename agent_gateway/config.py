@@ -96,6 +96,12 @@ class VirtualConfig:
     host: str = "127.0.0.1"
     port: int = 18500
     auto_approve: List[str] = field(default_factory=list)
+    # An agent that is *already* bound to the real WeChat (Hermes' weixin
+    # channel is one) can keep its token: name it here and the virtual server
+    # accepts that existing token as an alias for a virtual identity. This is
+    # needed because some clients hard-wire their QR-login URL to Tencent, so
+    # they cannot re-bind through us — only reuse the binding they have.
+    reuse_real_token_for: str = ""
 
     def approves(self, name: str) -> bool:
         return (name or "").lower() in [n.lower() for n in self.auto_approve]
@@ -195,7 +201,11 @@ def load_config(path: str | os.PathLike[str]) -> Config:
         host=str(virtual_raw.get("host") or "127.0.0.1"),
         port=int(virtual_raw.get("port") or 18500),
         auto_approve=[str(n) for n in (virtual_raw.get("auto_approve") or [])],
+        reuse_real_token_for=str(virtual_raw.get("reuse_real_token_for") or "").lower(),
     )
+    if virtual.reuse_real_token_for and virtual.reuse_real_token_for not in agents:
+        raise ConfigError(
+            f"virtual.reuse_real_token_for='{virtual.reuse_real_token_for}' is not a configured agent")
 
     cfg = Config(
         account=account,
