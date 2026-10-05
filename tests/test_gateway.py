@@ -121,5 +121,27 @@ class DryRunTests(unittest.TestCase):
             gateway.shutdown()
 
 
+class EntryPointTests(unittest.TestCase):
+    """The command the README tells people to run must actually run."""
+
+    def test_python_m_agent_gateway_help_works(self):
+        import pathlib
+        import subprocess
+        root = pathlib.Path(__file__).resolve().parent.parent
+        proc = subprocess.run([sys.executable, "-m", "agent_gateway", "--help"],
+                              cwd=root, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("gateway.json", proc.stdout)
+
+    def test_missing_config_says_what_to_do(self):
+        import pathlib
+        import subprocess
+        root = pathlib.Path(__file__).resolve().parent.parent
+        proc = subprocess.run([sys.executable, "-m", "agent_gateway", "-c", "no-such-file.json"],
+                              cwd=root, capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("gateway.example.json", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

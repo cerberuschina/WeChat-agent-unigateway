@@ -169,13 +169,15 @@ def qr_status(qrcode: str, base_url: str = BASE_URL) -> Dict[str, Any]:
 
 
 def qr_login(*, bot_type: str = "3", timeout_seconds: int = 480,
-             base_url: str = BASE_URL,
+             base_url: str = BASE_URL, max_refreshes: int = 3,
              on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> Optional[Dict[str, str]]:
     """Blocking QR login. Returns creds dict on success, ``None`` on timeout.
 
-    ``on_event`` gets ``("qr", {"qrcode":..., "url":...})`` once per QR (it is
-    re-fetched when it expires) and ``("status", {...})`` for each poll result,
-    so a CLI can render the QR / progress.
+    The QR expires in ~2 minutes, so on ``expired`` a fresh one is fetched
+    (``max_refreshes`` times) and reported through ``on_event`` again.
+
+    ``on_event`` gets ``("qr", {"qrcode":..., "url":...})`` once per QR and
+    ``("status", {...})`` for each poll result, so a CLI can render progress.
     """
     qrcode, url = fetch_qr(bot_type, base_url)
     if not qrcode:
@@ -198,7 +200,7 @@ def qr_login(*, bot_type: str = "3", timeout_seconds: int = 480,
             current_base = f"https://{status['redirect_host']}"
         elif state == "expired":
             refreshes += 1
-            if refreshes > 3:
+            if refreshes >= max_refreshes:
                 return None
             qrcode, url = fetch_qr(bot_type, current_base)
             if on_event:
