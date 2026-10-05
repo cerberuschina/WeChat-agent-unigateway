@@ -46,7 +46,8 @@
 
 ```bash
 # 1) 拿代码（无依赖，不需要 pip install）
-git clone <this-repo> && cd hermesWork
+git clone https://github.com/cerberuschina/WeChat-agent-unigateway.git
+cd WeChat-agent-unigateway
 
 # 2) 绑定一个微信（微信里装好 ClawBot 插件，扫码）
 python login.py                 # 凭证写入 data/account.json（已在 .gitignore 里）
@@ -103,9 +104,13 @@ python -m agent_gateway --config gateway.json
 
 ## 与 a2a-bridge 的关系
 
-本项目**不自带** agent 服务端。本机已经有 [a2a-bridge](../a2a-bridge) 把
-`claude -p` 和 `hermes chat -q` 各自包成 A2A 端点（8799 / 8800），
-网关直接把它们当后端用；你也可以指向任何别的 A2A/HTTP/CLI。
+本项目**不自带** agent 服务端 —— 它只负责"一个微信入口 + 路由"。后端由你自己提供：
+
+- 已经有把 agent 包成 **A2A 端点**的东西（常见做法：一个小服务把 `claude -p` /
+  `hermes chat -q` 各自包成 `message/send` 端点，各占一个本地端口）→ 直接填 `url`；
+- 只有 HTTP 接口 → 用 `http` 后端；
+- 只有命令行 → 用 `exec` 后端；
+- 只有桌面应用（没有 CLI/API）→ 用 `bridges/electron_cdp.py`（见 `docs/BACKENDS-WORKBUDDY.md`）。
 
 ## 安全与注意事项
 
