@@ -93,7 +93,7 @@ class Approval:
 class ApprovalBroker:
     """Thread-safe registry of pending questions."""
 
-    def __init__(self, *, ttl: float = 180.0, clock: Callable[[], float] = time.time,
+    def __init__(self, *, ttl: float = 900.0, clock: Callable[[], float] = time.time,
                  max_history: int = 500) -> None:
         self.ttl = float(ttl)
         self._clock = clock

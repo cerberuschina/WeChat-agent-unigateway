@@ -111,8 +111,10 @@ class DeliveryConfig:
     error_template: str = "「{label}」这次没跑通：{error}"
     queue_template: str = "队列里还有 {n} 条，按顺序回。"
     # How long an agent's "may I?" stays open on the phone. Silence expires to
-    # *deny* — an unanswered question must never turn into permission.
-    approval_ttl_seconds: int = 180
+    # *deny* — an unanswered question must never turn into permission. 180s proved
+    # too short in practice: cards died while the phone was in a pocket, the agent
+    # read that as "denied" and asked again, so every task cost two round trips.
+    approval_ttl_seconds: int = 900
     # How long a `/always` ("本轮全放行") keeps auto-approving. It is a ceiling,
     # not the usual ending: the user's next message clears it sooner (gateway
     # calls ``ApprovalBroker.clear_auto``). Both bounds exist because approval is

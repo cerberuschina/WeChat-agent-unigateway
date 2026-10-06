@@ -51,6 +51,10 @@ class BrokerTests(unittest.TestCase):
         kw.setdefault("title", "想跑 npm test")
         return self.broker.request(**kw)
 
+    def test_the_default_deadline_is_long_enough_for_a_human(self):
+        """180 秒的教训：人不在手机边上时，卡不该先死（见 docs/APPROVALS.md）。"""
+        self.assertGreaterEqual(ApprovalBroker().ttl, 600.0)
+
     def test_ids_stay_typable_on_a_phone(self):
         ids = [short_id(n) for n in range(0, 40)]
         self.assertEqual(ids[0], "2")

@@ -56,7 +56,7 @@ Agent 那边什么都不用改，只要把微信的 base-url 指向 `http://127.
 详见 **[docs/VIRTUAL-ILINK.md](docs/VIRTUAL-ILINK.md)**。
 
 **卡在「需要批准」上的 agent**：给它一张**放行卡**——网关把「它想执行 xxx」发到你的微信，
-你回 `/approve <编号>` 才放行，不回就是拒绝（默认 180 秒）。嫌烦就回 `/always`，
+你回 `/approve <编号>` 才放行，不回就是拒绝（默认 900 秒）。嫌烦就回 `/always`，
 这一轮剩下的不再问你（有期限，你下一句话就收回）。`claude -p` 这种没人可问的会话
 因此能在无人值守下干活，而决定权始终在你手里。详见 **[docs/APPROVALS.md](docs/APPROVALS.md)**。
 
