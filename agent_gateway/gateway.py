@@ -321,8 +321,9 @@ class Gateway:
         if decision.set_sticky:
             self.store.set_sticky(sender, decision.set_sticky)
         # 用户又开口了 = 上一轮结束了：「本轮全放行」到此收回。
-        # 回答放行卡的那几条不算新的一轮，否则 /always 一句话就把自己关掉了。
-        if decision.kind not in ("approve", "reject", "always"):
+        # 回答放行卡的那几条不算新的一轮，否则 /always 一句话就把自己关掉了；
+        # /stop 同理——它是控制指令，不是新话题。
+        if decision.kind not in ("approve", "reject", "always", "stop"):
             self.approvals.clear_auto(sender)
         if decision.kind == "ignore":
             return
@@ -335,6 +336,10 @@ class Gateway:
 
         if decision.kind in ("approve", "reject", "always"):
             self._resolve_approval(sender, decision)
+            return
+
+        if decision.kind == "stop":
+            self._request_stop(sender)
             return
 
         agent = self.cfg.agent(decision.agent)
@@ -603,6 +608,26 @@ class Gateway:
             return
         log.info("approval %s -> asking %s", _safe(approval.id), _safe(peer))
         self._send(peer, self.approvals.describe(approval))
+
+    def _request_stop(self, sender: str) -> None:
+        """``/stop``: tell the agent that is working for this chat to drop it.
+
+        A virtual agent's process does not live here — it is the agent's own client
+        that runs the command — so this leaves a flag the client polls while it
+        waits, and answers the tap immediately either way.
+        """
+        if not self.virtual:
+            self._send(sender, "现在没有 agent 接在网关上，没有东西可停。")
+            return
+        running = sender in self._typing_loops      # 有活时那个循环在跑
+        if not self.virtual.request_stop(sender):
+            self._send(sender, "不知道你是哪个联系人，停不了。")
+            return
+        log.info("stop requested by %s (running=%s)", _safe(sender), running)
+        self._send(sender,
+                   "已经喊停了：还挂着的那个 agent 几秒内会松手并回你一句。"
+                   if running else
+                   "记下了。不过此刻没看到有任务在跑——如果它其实在跑，也会停下来。")
 
     def _resolve_approval(self, sender: str, decision) -> None:
         """``/approve [id]``、``/reject [id]``、``/always`` 从手机上来。"""

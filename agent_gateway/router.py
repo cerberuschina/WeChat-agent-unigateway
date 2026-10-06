@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-COMMANDS = ("help", "agents", "who", "use", "ping", "approve", "reject", "always")
+COMMANDS = ("help", "agents", "who", "use", "ping", "approve", "reject", "always", "stop")
 
 
 @dataclass
@@ -60,6 +60,7 @@ def help_text(cfg, sticky: Optional[str]) -> str:
         "/use <名字> → 这个会话以后都发给它",
         "/approve <编号> / /reject <编号> → 放行或拒绝 agent 等你点头的那件事",
         "/always → 这一轮剩下的都别再问，全部放行",
+        "/stop → 让正在跑的 agent 停下来（它几秒内会收到）",
         "/agents 看名单　/who 看当前　/help 看这条",
         "",
         "名单：",
@@ -106,6 +107,11 @@ def route(text: str, cfg, *, sticky: Optional[str] = None) -> Decision:
             # so the decision is made there; the id is optional (newest wins).
             return Decision("approve" if name in ("approve", "yes", "ok") else "reject",
                             text=rest.strip(), note=f"approval:{name}")
+
+        if name == "stop":
+            # "别做了" —— 网关停不了别人的进程，只能留个记号让正在等的 agent
+            # 自己去收（见 virtual_ilink.request_stop / 客户端每两秒的问询）。
+            return Decision("stop", text=rest.strip(), note="stop")
 
         if name == "always":
             # "这一轮别再问我了" —— 一次把本轮剩下的问题全放行。

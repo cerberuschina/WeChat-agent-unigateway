@@ -116,6 +116,7 @@ python -m agent_gateway --config gateway.json
 | `/use claude` | 这个会话以后都发给 claude |
 | `/approve k7` `/reject k7` | 放行 / 拒绝 agent 等你点头的事（编号可省 = 最新那张） |
 | `/always` | 这一轮剩下的都别再问，全部放行 |
+| `/stop` | 让正在跑的 agent 停下来（它几秒内会收到） |
 | `/who` `/agents` `/help` | 看当前 / 看名单 / 看用法 |
 
 ## 配置
@@ -218,7 +219,7 @@ docs/PROTOCOL.md            iLink 协议实测要点
 docs/BACKENDS-WORKBUDDY.md  WorkBuddy 实测结论 + 两条接法
 docs/JOIN.md               一键接入：每种 agent 一条命令、改了什么、怎么排错
 docs/SWITCH.md              把微信切到网关的步骤（含回滚）
-tests/             282 项离线测试
+tests/             303 项离线测试
 ```
 
 ## 已知限制 / Roadmap

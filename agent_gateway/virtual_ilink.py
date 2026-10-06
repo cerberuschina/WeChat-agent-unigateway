@@ -56,6 +56,9 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 0
 LONG_POLL_SECONDS = 30.0
 BIND_TTL_SECONDS = 600.0
+# How long a "/stop" stays pending. Long enough that an agent which only checks
+# between steps still sees it, short enough that it never kills a *later* run.
+STOP_TTL_SECONDS = 120.0
 
 
 def virtual_account_id(name: str) -> str:
@@ -228,6 +231,8 @@ class VirtualILinkServer:
         self._lock = threading.RLock()
         self._binds: Dict[str, VirtualBind] = {}   # qrcode -> bind
         self._by_token: Dict[str, VirtualBind] = {}
+        # peer -> deadline: "/stop" requests waiting for their agent to notice.
+        self._stops: Dict[str, float] = {}
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -311,6 +316,27 @@ class VirtualILinkServer:
         # holds is an alias for its virtual identity.
         self._log(f"virtual: real token reused for agent {name}")
         return self.ensure_bind(name, issued=True)
+
+    # -- stop requests ---------------------------------------------------
+    def request_stop(self, peer: str, *, ttl: float = STOP_TTL_SECONDS) -> bool:
+        """Remember that this chat wants the running agent to drop what it does.
+
+        The gateway cannot kill another process's work, so this is a flag the
+        agent's own client polls while it waits (that is where the process lives).
+        """
+        if not peer:
+            return False
+        with self._lock:
+            self._stops[peer] = time.time() + float(ttl)
+        self._log(f"virtual: stop requested for {peer}")
+        return True
+
+    def take_stop(self, peer: str) -> bool:
+        """True exactly once per request — an agent that acted on it clears it."""
+        now = time.time()
+        with self._lock:
+            deadline = self._stops.pop(peer, 0.0)
+        return bool(deadline and deadline > now)
 
     # -- routing helpers -------------------------------------------------
     def deliver(self, agent: str, *, text: str, peer: str, message_id: str = "",
@@ -618,6 +644,17 @@ def _make_handler(server: VirtualILinkServer):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                return
+            if path == "/agent/stop":
+                # What the client asks every couple of seconds while a run is in
+                # flight: "有没有人喊停？" — one answer per request.
+                bind = server._bind_for_token(self._token())
+                if not bind or not bind.confirmed:
+                    self._send({"ret": ERR_SESSION_EXPIRED, "errmsg": "需要虚拟身份的 token"},
+                               status=401)
+                    return
+                wanted = params.get("peer") or bind.last_peer
+                self._send({"ret": RET_OK, "stop": server.take_stop(wanted), "peer": wanted})
                 return
             if path.startswith("/agent/approval/"):
                 # The blocked agent waits here; /wait long-polls like the rest of

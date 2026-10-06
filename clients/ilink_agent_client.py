@@ -79,9 +79,38 @@ def save_sessions(path: Path, sessions: dict) -> None:
     path.write_text(json.dumps(sessions, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+class RunnerStopped(RuntimeError):
+    """The user typed /stop while this run was in flight."""
+
+
+def _terminate(proc: subprocess.Popen) -> None:
+    """Kill the agent *and* whatever it spawned.
+
+    The runner is usually a wrapper (``cc_runner.py`` → ``claude.exe`` → its own
+    tools), so killing only the direct child would leave the real work running.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=30)
+        else:
+            proc.kill()
+    except Exception:  # noqa: BLE001 - stopping is best effort, never fatal
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def run_agent(argv: list[str], text: str, *, use_stdin: bool, timeout: float, cwd: str,
-              session: str = "") -> str:
-    """Run the agent command once and return its answer."""
+              session: str = "", stop: "threading.Event | None" = None) -> str:
+    """Run the agent command once and return its answer.
+
+    ``stop`` is watched while the child runs, so a ``/stop`` from the phone ends the
+    work instead of waiting out ``timeout`` (an hour by default).
+    """
     if use_stdin:
         command = argv
         stdin = text
@@ -91,11 +120,31 @@ def run_agent(argv: list[str], text: str, *, use_stdin: bool, timeout: float, cw
         if command == argv and PLACEHOLDER not in argv:
             command = argv + [text]          # no placeholder: append the text
         stdin = None
-    proc = subprocess.run(command, input=stdin, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout,
-                          cwd=cwd or None)
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
+    proc = subprocess.Popen(command, stdin=subprocess.PIPE if stdin is not None else None,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace", cwd=cwd or None)
+
+    watcher = None
+    if stop is not None:
+        def watch() -> None:
+            while proc.poll() is None:
+                if stop.is_set():
+                    _terminate(proc)
+                    return
+                time.sleep(0.3)
+
+        watcher = threading.Thread(target=watch, name="runner-stop", daemon=True)
+        watcher.start()
+    try:
+        out, err = proc.communicate(input=stdin, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate(proc)
+        proc.communicate()
+        raise
+    if stop is not None and stop.is_set():
+        raise RunnerStopped("（收到 /stop，这次没跑完）")
+    out = (out or "").strip()
+    err = (err or "").strip()
     if proc.returncode != 0 and not out:
         raise RuntimeError(f"退出码 {proc.returncode}：{err[:300] or '（没有输出）'}")
     if err and not out:
@@ -133,15 +182,30 @@ def run_with_progress(runner: list[str], text: str, args, session: str, sender: 
     def work() -> None:
         try:
             holder["answer"] = run_agent(runner, text, use_stdin=args.stdin,
-                                         timeout=args.timeout, cwd=args.cwd, session=session)
+                                         timeout=args.timeout, cwd=args.cwd, session=session,
+                                         stop=stop)
+        except RunnerStopped as stopped_note:
+            holder["answer"] = str(stopped_note)
         except subprocess.TimeoutExpired:
             holder["answer"] = f"（跑了 {args.timeout:.0f} 秒还没完，这次先放弃）"
         except Exception as exc:  # noqa: BLE001 - the agent must never kill the loop
             holder["answer"] = f"（跑挂了：{exc}）"
 
+    def watch_for_stop() -> None:
+        """每两秒问一次网关：用户有没有在本轮里发 /stop。"""
+        while worker.is_alive() and not stop.is_set():
+            if stop_requested(client, sender):
+                log("收到 /stop，停下这次运行。")
+                stop.set()
+                return
+            time.sleep(2.0)
+
+    stop = threading.Event()
     worker = threading.Thread(target=work, name="runner", daemon=True)
+    watcher = threading.Thread(target=watch_for_stop, name="runner-stop-watch", daemon=True)
     started = time.time()
     worker.start()
+    watcher.start()
     hb = max(float(args.progress_every), 0.0)
     notes = getattr(args, "progress_notes", False)
     delay = hb
@@ -401,6 +465,29 @@ def _no_proxy_opener():
     import urllib.request as _urlrequest
 
     return _urlrequest.build_opener(_urlrequest.ProxyHandler({}))
+
+
+def stop_requested(client, peer: str) -> bool:
+    """Ask the gateway whether the user typed ``/stop`` for this chat.
+
+    Polled while a run is in flight: the work happens in *this* process, so nobody
+    else can end it. Any failure means "no stop" — a check must never break a run.
+    """
+    import urllib.parse as _urlparse
+    import urllib.request
+
+    base = str(getattr(client, "base_url", "") or "").rstrip("/")
+    token = str(getattr(client, "token", "") or "")
+    if not base:
+        return False
+    url = f"{base}/agent/stop?peer={_urlparse.quote(peer or '')}"
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with _no_proxy_opener().open(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception:  # noqa: BLE001 - never let a stop check kill the run
+        return False
+    return bool(payload.get("stop"))
 
 
 def ask_approval(client, peer: str, title: str, detail: str = "", *, kind: str = "command",
