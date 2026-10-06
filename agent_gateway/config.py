@@ -120,6 +120,13 @@ class DeliveryConfig:
     # calls ``ApprovalBroker.clear_auto``). Both bounds exist because approval is
     # the permissive direction — an unbounded "yes" eventually fires unattended.
     always_window_seconds: float = 1800.0
+    # What to do with a message that arrives while this chat's agent is still
+    # working (Hermes calls the same knob busy_input_mode):
+    #   "queue"     — hand it over; the agent gets to it when it finishes
+    #   "interrupt" — stop the running task first, then hand this one over
+    # "steer" (typing into the running task) is not implemented: our agents are
+    # CLIs that read one prompt per run, so there is nothing to type into.
+    busy_mode: str = "queue"
 
 
 @dataclass
@@ -308,6 +315,10 @@ def load_config(path: str | os.PathLike[str]) -> Config:
               for name, cfg in agents_raw.items()}
 
     delivery = DeliveryConfig(**(raw.get("delivery") or {}))
+    if delivery.busy_mode not in ("queue", "interrupt"):
+        raise ConfigError(
+            f"delivery.busy_mode 只能是 'queue' 或 'interrupt'，收到 {delivery.busy_mode!r}"
+            "（'steer' 需要 agent 配合，CLI agent 给不了）")
     access = AccessConfig(allowed_users=[str(u) for u in (raw.get("access") or {}).get("allowed_users") or []])
 
     virtual_raw = dict(raw.get("virtual") or {})

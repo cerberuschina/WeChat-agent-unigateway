@@ -386,6 +386,12 @@ def main(argv: list | None = None) -> int:
             log(f"取消息失败：{exc}（2 秒后重试）")
             time.sleep(2)
             continue
+        except Exception as exc:  # noqa: BLE001 - 网关重启会把长轮询掐断
+            # 今天咬过一次：我重启网关，客户端一个 ConnectionResetError 就退出了，
+            # 微信那条链路跟着死。连接断了是重启的正常副作用，重试就行，不该退出。
+            log(f"和网关的连接断了（{exc}），5 秒后重连。")
+            time.sleep(5)
+            continue
 
         new_cursor = str(response.get("get_updates_buf") or "")
         if new_cursor and new_cursor != cursor:

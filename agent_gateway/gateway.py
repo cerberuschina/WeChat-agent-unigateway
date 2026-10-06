@@ -352,7 +352,8 @@ class Gateway:
         # its own iLink long-poll (it thinks it is talking to WeChat). We just
         # drop the message into its queue and wait for it to answer.
         if agent.type == "virtual":
-            self._dispatch_virtual(agent, decision.text, sender, message_id, context_token)
+            self._dispatch_virtual(agent, decision.text, sender, message_id, context_token,
+                                   busy=str(decision.metadata.get("busy") or ""))
             return
 
         with self._chat_lock(sender):
@@ -377,11 +378,20 @@ class Gateway:
             self._send(sender, reply)
 
     def _dispatch_virtual(self, agent, text: str, sender: str, message_id: str,
-                          context_token: str) -> None:
+                          context_token: str, *, busy: str = "") -> None:
         if not self.virtual:
             self._send(sender, f"「{agent.display}」是虚拟接入的，但这个网关没开 virtual 模式"
                                f"（gateway.json 的 virtual.enabled）。")
             return
+        # Busy handling (Hermes calls this busy_input_mode): a message that lands
+        # while this chat's agent is still working either waits its turn or takes
+        # over. "interrupt" reuses the /stop machinery — the flag is what the
+        # agent's client polls while it waits — so nothing new has to be invented.
+        mode = busy or self.cfg.delivery.busy_mode
+        if mode == "interrupt" and sender in self._typing_loops:
+            if self.virtual.request_stop(sender):
+                log.info("busy=interrupt: stopping the running task for %s", _safe(sender))
+                self._send(sender, f"⏹️ 先停下「{agent.display}」手里那件，改做这条。")
         delivered = self.virtual.deliver(agent.name, text=text, peer=sender,
                                         message_id=message_id, context_token=context_token)
         if not delivered:
@@ -547,6 +557,7 @@ class Gateway:
             "virtual": virtual,
             "delivery": {
                 "max_messages_per_turn": self.cfg.delivery.max_messages_per_turn,
+                "busy_mode": self.cfg.delivery.busy_mode,
                 "reserve_for_answer": self.cfg.delivery.reserve_for_answer,
                 "max_chars_per_message": self.cfg.delivery.max_chars_per_message,
                 "per_peer": {peer: {"used": used, "left": self._budget_left(peer)}
