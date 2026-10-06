@@ -140,6 +140,40 @@ class VirtualBind:
             return self.cursor, messages
 
 
+class _AddressAwareServer(ThreadingHTTPServer):
+    """HTTP server that can listen on IPv6 (and dual-stack when bound to ``::``).
+
+    ``ThreadingHTTPServer`` inherits ``AF_INET``, so an IPv6 host used to fail at
+    bind time. ``IPV6_V6ONLY=0`` lets a ``::`` bind accept IPv4-mapped clients as
+    well; if the platform refuses that, we stay IPv6-only rather than crash.
+    """
+
+    dual_stack = True
+
+    def __init__(self, address, handler, family=None):
+        import socket
+        if family is not None:
+            self.address_family = family      # must be set before the socket exists
+        super().__init__(address, handler)
+
+    def server_bind(self) -> None:
+        import socket
+        if self.address_family == socket.AF_INET6 and self.dual_stack:
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except (AttributeError, OSError):
+                pass
+        super().server_bind()
+
+
+def _make_server(host: str, port: int, handler) -> "_AddressAwareServer":
+    """Pick the address family from the host, so ``::`` and ``::1`` just work."""
+    import socket
+    if ":" in (host or ""):
+        return _AddressAwareServer((host, port, 0, 0), handler, socket.AF_INET6)
+    return _AddressAwareServer((host, port), handler, socket.AF_INET)
+
+
 class VirtualILinkServer:
     """HTTP server that mimics the iLink bot API for local agents."""
 
@@ -282,7 +316,7 @@ class VirtualILinkServer:
     # -- http ------------------------------------------------------------
     def start(self) -> Tuple[str, int]:
         handler = _make_handler(self)
-        self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
+        self._httpd = _make_server(self.host, self.port, handler)   # IPv6-aware
         self._httpd.daemon_threads = True
         self.port = self._httpd.server_address[1]
         # Pre-authorise the listed agents: their identity exists from the start,
@@ -306,7 +340,9 @@ class VirtualILinkServer:
             self._httpd = None
 
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        # An IPv6 literal needs brackets or the URL is unusable ("http://::1:18500").
+        host = f"[{self.host}]" if ":" in self.host and not self.host.startswith("[") else self.host
+        return f"http://{host}:{self.port}"
 
     # -- endpoint bodies (also directly unit-testable) -------------------
     # -- remote (non-local) agents ---------------------------------------

@@ -133,8 +133,6 @@ class RemoteClientTests(unittest.TestCase):
             self.assertFalse(client.is_local_gateway(url), url)
 
     def test_upload_blob_posts_the_bytes_with_our_token(self):
-        import urllib.request as urlrequest
-
         captured = {}
 
         class FakeResponse:
@@ -147,19 +145,20 @@ class RemoteClientTests(unittest.TestCase):
             def __exit__(self, *_exc):
                 return False
 
-        def fake_urlopen(request, timeout=0):
-            captured["url"] = request.full_url
-            captured["headers"] = {k.lower(): v for k, v in request.headers.items()}
-            captured["data"] = request.data
-            return FakeResponse()
+        class FakeOpener:
+            def open(self, request, timeout=0):
+                captured["url"] = request.full_url
+                captured["headers"] = {k.lower(): v for k, v in request.headers.items()}
+                captured["data"] = request.data
+                return FakeResponse()
 
-        real = urlrequest.urlopen
-        urlrequest.urlopen = fake_urlopen
+        real = client._no_proxy_opener
+        client._no_proxy_opener = lambda: FakeOpener()
         try:
             gateway = type("C", (), {"base_url": "http://gw:18500", "token": "tok"})()
             blob = client.upload_blob(gateway, "a b.bin", b"xyz")
         finally:
-            urlrequest.urlopen = real
+            client._no_proxy_opener = real
 
         self.assertEqual(blob, "blob:abc")
         self.assertEqual(captured["url"], "http://gw:18500/upload")

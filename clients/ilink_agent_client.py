@@ -381,21 +381,32 @@ def is_local_gateway(base_url: str) -> bool:
     return host in {"127.0.0.1", "localhost", "::1", "0.0.0.0", ""}
 
 
+def _no_proxy_opener():
+    """An opener that ignores HTTP(S)_PROXY.
+
+    The gateway is on this machine or on the LAN; a corporate/system proxy in the
+    middle would turn those requests into 502s.
+    """
+    import urllib.request as _urlrequest
+
+    return _urlrequest.build_opener(_urlrequest.ProxyHandler({}))
+
+
 def upload_blob(client, name: str, data: bytes) -> str:
     """Push file bytes to the gateway; returns a ``blob:<id>`` reference.
 
     A remote agent cannot hand over a path — its filesystem is not the gateway's.
     """
     import urllib.parse as _urlparse
-    import urllib.request as _urlrequest
+    import urllib.request
 
     url = f"{str(client.base_url).rstrip('/')}/upload"
-    request = _urlrequest.Request(
+    request = urllib.request.Request(
         url, data=data, method="POST",
         headers={"Authorization": f"Bearer {client.token}",
                  "X-File-Name": _urlparse.quote(name),
                  "Content-Type": "application/octet-stream"})
-    with _urlrequest.urlopen(request, timeout=300) as response:
+    with _no_proxy_opener().open(request, timeout=300) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if int(payload.get("ret", -1)) != 0 or not payload.get("blob"):
         raise RuntimeError(f"网关拒绝了上传：{payload}")
@@ -405,10 +416,10 @@ def upload_blob(client, name: str, data: bytes) -> str:
 def fetch_remote_media(client, url: str, out_dir: Path) -> Path:
     """Download one media file the gateway stored (remote agents only)."""
     import urllib.parse as _urlparse
-    import urllib.request as _urlrequest
+    import urllib.request
 
-    request = _urlrequest.Request(url, headers={"Authorization": f"Bearer {client.token}"})
-    with _urlrequest.urlopen(request, timeout=300) as response:
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {client.token}"})
+    with _no_proxy_opener().open(request, timeout=300) as response:
         data = response.read()
         name = _urlparse.unquote(response.headers.get("X-File-Name") or "media.bin")
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -161,7 +161,7 @@ python -m agent_gateway --config gateway.json
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -t .     # 192 项，全部离线（不联网、不碰微信）
+python -m unittest discover -s tests -t .     # 203 项，全部离线（不联网、不碰微信）
 ```
 
 测试覆盖：路由语法（含命令与 agent 前缀冲突）、A2A 回复提取、exec 后端（argv/stdin/超时/非零退出）、
@@ -189,7 +189,7 @@ docs/REMOTE-AGENTS.md       非本机 agent 接入：bind_key、上传/下载、
 docs/PROTOCOL.md            iLink 协议实测要点
 docs/BACKENDS-WORKBUDDY.md  WorkBuddy 实测结论 + 两条接法
 docs/SWITCH.md              把微信切到网关的步骤（含回滚）
-tests/             192 项离线测试
+tests/             203 项离线测试
 ```
 
 ## 已知限制 / Roadmap

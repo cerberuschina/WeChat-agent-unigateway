@@ -417,7 +417,7 @@ class Gateway:
         host, port = self.virtual.start()
         print(f"\n虚拟 iLink 已就绪：{self.virtual.base_url()}")
         print("  把 agent 的微信 base_url 指到这里，它就等于接上了微信（例：Hermes 用 WEIXIN_BASE_URL）")
-        print(f"  待批准的接入：http://{host}:{port}/admin/binds\n")
+        print(f"  待批准的接入：{self.virtual.base_url()}/admin/binds\n")
         if reused:
             print(f"  已复用真 token 的 agent：{reused}（它原来的微信绑定不用改，直接指过来即可）\n")
         for agent in self.cfg.enabled_agents():

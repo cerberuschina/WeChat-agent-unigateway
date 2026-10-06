@@ -115,6 +115,36 @@ def _raise_for_status(payload: Dict[str, Any], context: str) -> Dict[str, Any]:
     raise ILinkError(detail, ret=ret, errcode=errcode, payload=payload)
 
 
+def _is_private_host(host: str) -> bool:
+    """Loopback / LAN / link-local / ULA — a proxy in the middle is wrong there."""
+    host = (host or "").strip("[]").lower()
+    if not host or host == "localhost":
+        return True
+    if host == "::1" or host.startswith(("127.", "10.", "192.168.", "169.254.", "::ffff:127.")):
+        return True
+    if ":" in host and host.startswith(("fe80:", "fc", "fd")):   # IPv6 link-local / ULA
+        return True
+    if host.startswith("172."):
+        try:
+            second = int(host.split(".")[1])
+        except (IndexError, ValueError):
+            return False
+        return 16 <= second <= 31
+    return False
+
+
+def _opener_for(url: str):
+    """A no-proxy opener for local/LAN targets, ``None`` (default) otherwise.
+
+    Traffic to Tencent should keep honouring the system proxy — that is how it
+    reaches the internet here. An agent talking to a gateway on this machine or on
+    the LAN must not: a proxy there answers 502 instead of connecting.
+    """
+    if _is_private_host(urllib.parse.urlsplit(url).hostname or ""):
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return None
+
+
 def _request(method: str, base_url: str, endpoint: str, *, token: Optional[str] = None,
              payload: Optional[Dict[str, Any]] = None, timeout_ms: int = API_TIMEOUT_MS,
              extra_headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -128,9 +158,14 @@ def _request(method: str, base_url: str, endpoint: str, *, token: Optional[str] 
         headers.update(extra_headers)
     request = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
     timeout = max(timeout_ms / 1000.0, 1.0)
+    opener = _opener_for(url)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", "replace")
+        if opener is None:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8", "replace")
+        else:
+            with opener.open(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:  # pragma: no cover - network path
         raw = exc.read().decode("utf-8", "replace") if exc.fp else ""
         raise ILinkError(f"HTTP {exc.code} on {endpoint}: {raw[:200]}") from exc
