@@ -79,14 +79,14 @@ class BusyModeConfigTests(unittest.TestCase):
         cfg = load_config(write_config(self.tmp, busy_mode="interrupt"))
         self.assertEqual(cfg.delivery.busy_mode, "interrupt")
 
-    def test_a_typo_is_refused_loudly(self):
-        with self.assertRaises(ConfigError):
-            load_config(write_config(self.tmp, busy_mode="stear"))
+    def test_steer_is_allowed(self):
+        cfg = load_config(write_config(self.tmp, busy_mode="steer"))
+        self.assertEqual(cfg.delivery.busy_mode, "steer")
 
-    def test_steer_is_refused_with_a_reason(self):
+    def test_a_typo_is_refused_loudly(self):
         with self.assertRaises(ConfigError) as caught:
-            load_config(write_config(self.tmp, busy_mode="steer"))
-        self.assertIn("CLI", str(caught.exception), "得说清为什么不做，别让人以为漏了")
+            load_config(write_config(self.tmp, busy_mode="stear"))
+        self.assertIn("steer", str(caught.exception), "报错里该列出合法取值")
 
 
 class BusyModeGatewayTests(unittest.TestCase):
@@ -135,6 +135,15 @@ class BusyModeGatewayTests(unittest.TestCase):
         self.make(busy_mode="interrupt")
         self.say("闲着的时候来一条")
         self.assertEqual(self.gateway.virtual.stops, {})
+
+    def test_steer_mode_injects_instead_of_stopping(self):
+        self.make(busy_mode="steer")
+        self.fall_busy()
+        self.say("顺手改成这样")
+        self.assertEqual(self.gateway.virtual.stops, {}, "steer 不该停掉它")
+        self.assertTrue(any("插进" in text for text in self.sent), self.sent)
+        self.assertIn("顺手改成这样", [t for _a, t, _p in self.gateway.virtual.delivered],
+                      "话还是得交到 agent 手里")
 
     def test_slash_queue_overrides_interrupt(self):
         self.make(busy_mode="interrupt")

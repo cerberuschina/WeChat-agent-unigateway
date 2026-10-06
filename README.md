@@ -137,15 +137,20 @@ python -m agent_gateway --config gateway.json
 
   "delivery": { "max_chars_per_message": 1200, "ack": true,
                 "ack_template": "已转给 {label}，算完就回。",
-                "busy_mode": "queue" },   // 有活在跑时又来一条：queue=排队 / interrupt=打断它
+                "busy_mode": "queue" },   // 有活在跑时又来一条：queue 排队 / interrupt 打断 / steer 插进会话
   "access":   { "allowed_users": [] }   // 空 = 谁都能用（单机常见）；填了就只认这些 from_user_id
 }
 ```
 
-**繁忙模式**（对齐 Hermes 的 `busy_input_mode`）：`queue`（默认，等它跑完再接）或 `interrupt`
-（先停掉正在跑的那件，再接手这条；用的是 `/stop` 同一套机制）。`steer` 不做——我们的 agent
-是 CLI，一次只读一个 prompt，没有"往正在跑的活里打字"这回事。两条命令随时可以按条覆盖：
-`/stop` 停掉当前这件，`/queue <内容>` 明说这条排后面。
+**繁忙模式**（对齐 Hermes 的 `busy_input_mode`）：`queue`（默认，等它跑完再接）、
+`interrupt`（先停掉正在跑的那件，再接手这条），或 `steer`（**话立刻收下**，写进正在跑的
+那个会话里，它当前这一步一结束就照办；用的是客户端的长命会话 `--session-command`，没开那个
+选项时 steer 的表现跟 queue 一样）。三条命令随时可以按条覆盖：`/stop` 停掉当前这件，
+`/queue <内容>` 明说这条排后面。
+
+`steer` 的边界要讲清：CLI 这一侧**没法把话塞进它此刻的思考里** —— 实测（真 claude，
+`--input-format stream-json`）跑到一半插的话不会改变当前这一轮，而是在它这一轮结束后
+立刻成为下一轮。要它**马上**改做别的，那是 `/stop`（或 `interrupt`）的事。
 
 `account` 留空时会去读 `data/account.json`（`login.py` 写的那个）。想换绑：删掉它重新扫码。
 

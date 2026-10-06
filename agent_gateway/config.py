@@ -124,8 +124,9 @@ class DeliveryConfig:
     # working (Hermes calls the same knob busy_input_mode):
     #   "queue"     — hand it over; the agent gets to it when it finishes
     #   "interrupt" — stop the running task first, then hand this one over
-    # "steer" (typing into the running task) is not implemented: our agents are
-    # CLIs that read one prompt per run, so there is nothing to type into.
+    #   "steer"     — hand it over *now*, into the running session: the agent picks
+    #                 it up the moment its current step ends (needs the client to
+    #                 run with --session-command, otherwise it behaves like queue)
     busy_mode: str = "queue"
 
 
@@ -315,10 +316,9 @@ def load_config(path: str | os.PathLike[str]) -> Config:
               for name, cfg in agents_raw.items()}
 
     delivery = DeliveryConfig(**(raw.get("delivery") or {}))
-    if delivery.busy_mode not in ("queue", "interrupt"):
+    if delivery.busy_mode not in ("queue", "interrupt", "steer"):
         raise ConfigError(
-            f"delivery.busy_mode 只能是 'queue' 或 'interrupt'，收到 {delivery.busy_mode!r}"
-            "（'steer' 需要 agent 配合，CLI agent 给不了）")
+            f"delivery.busy_mode 只能是 'queue' / 'interrupt' / 'steer'，收到 {delivery.busy_mode!r}")
     access = AccessConfig(allowed_users=[str(u) for u in (raw.get("access") or {}).get("allowed_users") or []])
 
     virtual_raw = dict(raw.get("virtual") or {})

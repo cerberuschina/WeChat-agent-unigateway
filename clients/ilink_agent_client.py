@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import shlex
 import subprocess
 import sys
@@ -39,6 +40,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_gateway import ilink, ilink_media, media  # noqa: E402
+from clients.stream_session import (ClaudeStreamSession, SessionDead,  # noqa: E402
+                                    TurnTimeout)
 
 PLACEHOLDER = "{text}"
 SESSION_PLACEHOLDER = "{session}"
@@ -165,6 +168,115 @@ def heartbeat(client, sender: str, message: dict, state: int) -> None:
                            context_token=message.get("context_token"))
     except Exception as exc:  # noqa: BLE001 - a heartbeat must never break the run
         log(f"（心跳发不出去：{exc}）")
+
+
+class PeerSession:
+    """一个联系人一条长命会话：能接着聊，也能在它跑的时候插话。
+
+    为什么不是"一条消息一个进程"：那样用户中途说的话只能排在后面（甚至丢），而且每轮
+    都要 cold start。这里把消息投进队列、由这个线程顺序处理 —— 正在跑的时候再来的话，
+    直接写进同一个会话（当前这一步一结束就生效，见 clients/stream_session.py）。
+    """
+
+    def __init__(self, peer: str, argv: list[str], *, cwd: str, env: dict, idle: float,
+                 client, sessions: dict, sessions_path: Path, max_chars: int = 0):
+        self.peer = peer
+        self.argv = argv
+        self.cwd = cwd
+        self.env = env
+        self.idle = idle
+        self.client = client
+        self.sessions = sessions
+        self.sessions_path = sessions_path
+        self.max_chars = max_chars
+        self.queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+        self.session = None
+        self.pending = 0
+        self.started_at = 0.0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name=f"peer-{peer[-6:]}", daemon=True)
+
+    # -- 外面只调这两个 --------------------------------------------------
+    def submit(self, text: str, message: dict) -> None:
+        self.queue.put((text, message))
+        if not self._thread.is_alive():
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # -- 内部 -----------------------------------------------------------
+    def _open(self) -> None:
+        command = list(self.argv)
+        known = self.sessions.get(self.peer) or ""
+        if known:
+            command += ["--resume", known]        # 客户端重启后接着上次的会话
+        made = ClaudeStreamSession(command, cwd=self.cwd, env=self.env, log=log)
+        made.start()
+        self.session = made
+        self.started_at = time.time()
+
+    def _close(self) -> None:
+        if self.session is not None:
+            self.session.stop()
+            self.session = None
+
+    def _reply(self, answer: str, message: dict) -> None:
+        answer, media_paths = extract_media_marks(answer)
+        if not answer.strip() and not media_paths:
+            answer = "（这次没有输出）"
+        chunks = [answer] if self.max_chars <= 0 else ilink.split_text(answer, self.max_chars)
+        for chunk in chunks:
+            self.client.send_text(self.peer, chunk, context_token=message.get("context_token"))
+        for path in media_paths:
+            send_local_media(self.client, self.peer, path, message)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            item = None
+            try:
+                item = self.queue.get(timeout=0.3)
+            except queue.Empty:
+                pass
+            if item is not None:
+                text, message = item
+                try:
+                    if self.session is None or not self.session.alive:
+                        self._open()
+                    # 正在跑也照样写进去：它会在当前这一步结束后立刻成为下一轮
+                    self.session.send(text)
+                    self.pending += 1
+                    if self.pending == 1:
+                        heartbeat(self.client, self.peer, message, ilink.TYPING_START)
+                except Exception as exc:  # noqa: BLE001 - 会话这边出事不能拖垮轮询
+                    log(f"（会话用不了：{exc}）")
+                    self._reply(f"（会话用不了：{exc}）", message)
+                    self._close()
+                    self.pending = 0
+                    continue
+            if not self.pending:
+                continue
+            try:
+                turn = self.session.turn(timeout=0.3)
+            except TurnTimeout:
+                continue
+            except SessionDead as exc:
+                log(f"（会话断了：{exc}）")
+                self._close()
+                self._reply(f"（会话断了，下一条我会重开：{exc}）", item[1] if item else {})
+                self.pending = 0
+                heartbeat(self.client, self.peer, item[1] if item else {}, ilink.TYPING_STOP)
+                continue
+            self.pending = max(0, self.pending - 1)
+            if turn.session_id and turn.session_id != self.sessions.get(self.peer):
+                self.sessions[self.peer] = turn.session_id
+                save_sessions(self.sessions_path, self.sessions)
+            self._reply(turn.text, item[1] if item else {})
+            if not self.pending:
+                heartbeat(self.client, self.peer, item[1] if item else {}, ilink.TYPING_STOP)
+                if self.idle and time.time() - self.started_at > self.idle:
+                    log("（会话空闲够久，收工；下次用 --resume 接着聊）")
+                    self._close()
 
 
 def run_with_progress(runner: list[str], text: str, args, session: str, sender: str,
@@ -304,6 +416,13 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--progress-every", type=float, default=45.0,
                         help="heartbeat every N seconds while the agent works (0 = off); "
                              "heartbeats go to the gateway and cost no WeChat messages")
+    parser.add_argument("--session-command", default="",
+                        help="长命会话模式：这条命令起一个双向流的 agent 进程（例如 "
+                             "\"claude -p --input-format stream-json --output-format stream-json "
+                             "--verbose\"），给了它就不要 --runner；同一个会话多轮共用，"
+                             "而且用户在它跑的时候插话会被立刻收下（当前这一步结束就生效）")
+    parser.add_argument("--session-idle", type=float, default=1800.0,
+                        help="会话空闲多久收工（秒）；下次启动用已知的 session id --resume 接着聊")
     parser.add_argument("--progress-notes", action="store_true",
                         help="send visible 「还在跑」 notes instead of heartbeats "
                              "(these DO spend WeChat's ~10 messages per turn)")
@@ -361,8 +480,9 @@ def main(argv: list | None = None) -> int:
                          ensure_ascii=False, indent=2))
         return 0
 
-    if not args.runner:
-        raise SystemExit("要么给 --runner，要么只做 --login-only。")
+    if not args.runner and not args.session_command:
+        raise SystemExit("要么给 --runner（一条消息一个进程），要么给 --session-command"
+                         "（长命会话，能边跑边插话），要么只做 --login-only。")
     # Windows paths in a --runner template would have their backslashes eaten by
     # posix-style splitting ("C:\x\y" -> "C:xy"), so normalise them to slashes.
     runner = shlex.split(args.runner.replace("\\", "/"))
@@ -373,6 +493,8 @@ def main(argv: list | None = None) -> int:
 
     cursor = str(creds.get("cursor") or "")
     handled = 0
+    session_command = shlex.split(args.session_command) if args.session_command else []
+    peer_sessions: dict = {}
     while True:
         try:
             response = client.get_updates(cursor)
@@ -412,6 +534,19 @@ def main(argv: list | None = None) -> int:
             started = time.time()
             session = sessions.get(sender, "")
             export_approval_env(client, sender)   # 工具钩子靠这几个变量找回网关
+            if session_command:
+                # 长命会话模式：这条消息不在这里等 —— 交给那个联系人的线程，它才收得住
+                # "边跑边插"（在这里等的话，插话只能排在后面）。
+                worker = peer_sessions.get(sender)
+                if worker is None:
+                    worker = PeerSession(sender, session_command, cwd=args.cwd,
+                                         env=os.environ.copy(), idle=args.session_idle,
+                                         client=client, sessions=sessions,
+                                         sessions_path=sessions_path, max_chars=args.max_chars)
+                    peer_sessions[sender] = worker
+                    log(f"（给 {sender[-8:]} 开一条长命会话）")
+                worker.submit(text, message)
+                continue
             answer = run_with_progress(runner, text, args, session, sender, client, message)
             answer, new_session = extract_session(answer)
             answer, media_paths = extract_media_marks(answer)

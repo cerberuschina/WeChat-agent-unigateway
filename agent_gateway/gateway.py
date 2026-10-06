@@ -388,10 +388,16 @@ class Gateway:
         # over. "interrupt" reuses the /stop machinery — the flag is what the
         # agent's client polls while it waits — so nothing new has to be invented.
         mode = busy or self.cfg.delivery.busy_mode
-        if mode == "interrupt" and sender in self._typing_loops:
-            if self.virtual.request_stop(sender):
+        if sender in self._typing_loops:
+            if mode == "interrupt" and self.virtual.request_stop(sender):
                 log.info("busy=interrupt: stopping the running task for %s", _safe(sender))
                 self._send(sender, f"⏹️ 先停下「{agent.display}」手里那件，改做这条。")
+            elif mode == "steer":
+                # 它正在跑，但客户端那条长命会话接得住：话立刻收下，当前这一步一
+                # 结束就生效（不是插进它此刻的思考里——那是 CLI 给不了的边界）。
+                log.info("busy=steer: handing this to the running session for %s", _safe(sender))
+                self._send(sender, f"📨 插进「{agent.display}」正在做的那一轮了，"
+                                   f"它这一步结束就照办。")
         delivered = self.virtual.deliver(agent.name, text=text, peer=sender,
                                         message_id=message_id, context_token=context_token)
         if not delivered:
