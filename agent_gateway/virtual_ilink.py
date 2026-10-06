@@ -149,6 +149,7 @@ class VirtualILinkServer:
                  accept_tokens: Optional[Dict[str, str]] = None,
                  on_outbound: Optional[Callable[[VirtualBind, str], None]] = None,
                  on_outbound_items: Optional[Callable[[VirtualBind, List[Dict[str, Any]]], None]] = None,
+                 on_typing: Optional[Callable[[VirtualBind, int], None]] = None,
                  on_log: Optional[Callable[[str], None]] = None):
         self.host = host
         self.port = port
@@ -161,6 +162,9 @@ class VirtualILinkServer:
         # Media a virtual agent wants delivered: the gateway turns these into real
         # iLink items (upload + encrypt) on its own way out.
         self.on_outbound_items = on_outbound_items
+        # Heartbeats from an agent ("still working") — the gateway holds the real
+        # typing indicator; nothing is sent to WeChat for these.
+        self.on_typing = on_typing
         self._log = on_log or (lambda _m: None)
         self._lock = threading.RLock()
         self._binds: Dict[str, VirtualBind] = {}   # qrcode -> bind
@@ -466,6 +470,13 @@ def _make_handler(server: VirtualILinkServer):
                 self._send(server.ep_sendmessage(bind, payload))
                 return
             if path == "/ilink/bot/sendtyping":
+                # A heartbeat, not a message: state 1 = 还在干活，2 = 收工。
+                try:
+                    state = int(payload.get("state"))
+                except (TypeError, ValueError):
+                    state = 1
+                if server.on_typing:
+                    server.on_typing(bind, state)
                 self._send({"ret": RET_OK})
                 return
             if path == "/ilink/bot/getconfig":

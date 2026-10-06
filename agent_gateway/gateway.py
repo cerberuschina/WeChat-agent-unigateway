@@ -208,6 +208,20 @@ class Gateway:
         if not quiet:
             self._typing(chat_id, ilink.TYPING_STOP)
 
+    def _agent_typing(self, bind, state: int) -> None:
+        """An agent heartbeat: keep 「正在输入」 up while it works.
+
+        Heartbeats never become WeChat messages — that is the point, since WeChat
+        only allows a bot ~10 messages before the user replies again.
+        """
+        peer = bind.last_peer
+        if not peer:
+            return
+        if state == ilink.TYPING_STOP:
+            self._stop_typing(peer)
+        else:
+            self._start_typing(peer)      # 幂等：已在跑就重置那 30 分钟的上限
+
     # -- message handling ------------------------------------------------
     def _ingest_media(self, message: dict, sender: str) -> str:
         """Download inbound media, keep it locally, describe it for the agent.
@@ -389,6 +403,7 @@ class Gateway:
             accept_tokens=self.cfg.virtual.reuse_tokens(self.cfg.account.token),
             on_outbound=self._forward_to_wechat,
             on_outbound_items=self._forward_media_to_wechat,
+            on_typing=self._agent_typing,
             on_log=log.info,
         )
         host, port = self.virtual.start()

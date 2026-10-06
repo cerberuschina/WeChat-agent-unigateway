@@ -195,6 +195,29 @@ class HttpSurfaceTests(unittest.TestCase):
         self.assertTrue(health["ok"])
         self.assertEqual(health["binds"], ["claude"])
 
+    def test_a_heartbeat_hits_the_typing_callback_and_sends_no_message(self):
+        """心跳必须是"不产生微信消息"的路径——否则它就是在偷额度。"""
+        seen = []
+        self.server.on_typing = lambda bind, state: seen.append((bind.name, state))
+        qr = get(f"{self.base}/ilink/bot/get_bot_qrcode?bot_type=3")
+        post(f"{self.base}/admin/approve", {"qrcode": qr["qrcode"], "name": "hermes"})
+        token = get(f"{self.base}/ilink/bot/get_qrcode_status?qrcode={qr['qrcode']}")["bot_token"]
+
+        result = post(f"{self.base}/ilink/bot/sendtyping",
+                      {"state": 1, "ilink_user_id": "wx-user"}, token=token)
+
+        self.assertEqual(result["ret"], 0)
+        self.assertEqual(seen, [("hermes", 1)])
+
+    def test_a_heartbeat_with_a_bogus_state_still_counts_as_working(self):
+        seen = []
+        self.server.on_typing = lambda bind, state: seen.append(state)
+        self.server.request_bind("claude")
+        bind = self.server.approve(self.server.binds()[0]["qrcode"], name="claude")
+        result = post(f"{self.base}/ilink/bot/sendtyping", {"state": "?"}, token=bind.token)
+        self.assertEqual(result["ret"], 0)
+        self.assertEqual(seen, [1])
+
 
 class WiringTests(unittest.TestCase):
     """Config + gateway wiring: no A2A call is involved for a virtual agent."""

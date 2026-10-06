@@ -126,50 +126,59 @@ class RenderingTests(unittest.TestCase):
 
 
 class ProgressNoteTests(unittest.TestCase):
-    """The agent side must say something while a long run is going on."""
+    """The agent side says "still working" without spending WeChat's budget."""
 
     class Args:
         stdin = False
         cwd = ""
         timeout = 30.0
 
-        def __init__(self, every, max_notes=3):
+        def __init__(self, every, notes=False):
             self.progress_every = every
-            self.max_progress_notes = max_notes
+            self.progress_notes = notes
 
-    def test_progress_notes_are_sent_while_the_runner_works(self):
-        sent = []
+    class Sink:
+        def __init__(self):
+            self.texts = []
+            self.typing = []
 
-        class Sink:
-            def send_text(self, chat_id, text, *, context_token=None):
-                sent.append(text)
+        def send_text(self, chat_id, text, *, context_token=None):
+            self.texts.append(text)
 
+        def send_typing(self, chat_id, state, *, typing_ticket="", context_token=None):
+            self.typing.append(state)
+
+    def test_heartbeats_go_to_the_gateway_and_no_message_is_sent(self):
+        sink = self.Sink()
         runner = [PY, "-c", "import time; time.sleep(1.2); print('干完了')"]
         answer = client_mod.run_with_progress(runner, "任务", self.Args(0.3), "", "wx-user",
-                                              Sink(), {"context_token": "ctx"})
+                                              sink, {"context_token": "ctx"})
         self.assertEqual(answer, "干完了")
-        self.assertTrue(any("还在跑" in text for text in sent), sent)
+        self.assertEqual(sink.texts, [], "心跳不能变成微信消息")
+        self.assertGreaterEqual(len(sink.typing), 1)
+        self.assertEqual(sink.typing[0], ilink.TYPING_START)
+        self.assertEqual(sink.typing[-1], ilink.TYPING_STOP, "收工要发一次 stop")
 
-    def test_progress_can_be_disabled(self):
-        sent = []
+    def test_progress_notes_are_opt_in_and_do_spend_messages(self):
+        sink = self.Sink()
+        runner = [PY, "-c", "import time; time.sleep(1.0); print('ok')"]
+        client_mod.run_with_progress(runner, "任务", self.Args(0.3, notes=True), "", "wx-user",
+                                     sink, {})
+        self.assertTrue(any("还在跑" in text for text in sink.texts), sink.texts)
+        self.assertEqual(sink.typing, [], "选了文字进度就不发心跳")
 
-        class Sink:
-            def send_text(self, chat_id, text, *, context_token=None):
-                sent.append(text)
-
-        runner = [PY, "-c", "import time; time.sleep(0.6); print('ok')"]
-        client_mod.run_with_progress(runner, "任务", self.Args(0), "", "wx-user",
-                                     Sink(), {})
-        self.assertEqual(sent, [])
+    def test_heartbeats_can_be_disabled(self):
+        sink = self.Sink()
+        runner = [PY, "-c", "import time; time.sleep(0.5); print('ok')"]
+        client_mod.run_with_progress(runner, "任务", self.Args(0), "", "wx-user", sink, {})
+        self.assertEqual(sink.texts, [])
+        self.assertEqual(sink.typing, [], "关掉之后连 stop 都不发")
 
     def test_a_crashing_runner_is_reported_as_text(self):
-        class Sink:
-            def send_text(self, chat_id, text, *, context_token=None):
-                pass
-
+        sink = self.Sink()
         runner = [PY, "-c", "raise SystemExit(2)"]
         answer = client_mod.run_with_progress(runner, "任务", self.Args(0), "", "wx-user",
-                                              Sink(), {})
+                                              sink, {})
         self.assertIn("跑挂了", answer)
 
 
