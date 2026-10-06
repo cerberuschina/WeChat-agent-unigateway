@@ -18,6 +18,11 @@ Useful flags
     --stdin          feed the message to the command on stdin instead of {text}
     --timeout N      per-message timeout for the agent command (default 900s)
     --creds PATH     where the virtual identity + cursor live (default data/virtual-client-<name>.json)
+    --reuse-token T  start with a token the gateway already knows (put it in the
+                     config as ``virtual.accept_tokens.<name>: file:...``). Without
+                     this the client's identity lives only in the gateway's memory,
+                     so restarting the gateway drops it off its long poll and the
+                     client exits with ret=-14.
 """
 from __future__ import annotations
 

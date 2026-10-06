@@ -209,7 +209,12 @@ class Gateway:
         def loop() -> None:
             while not stop.is_set() and time.monotonic() < deadline:
                 self._typing(chat_id, ilink.TYPING_START)
-                stop.wait(45.0)
+                # WeChat's indicator has a short life and the API does not say how
+                # long. The user's own observation pinned it: the light shows right
+                # after their message arrives and is already gone by the time the run
+                # gets going — so re-arming on the old 45s cadence left it off most
+                # of the time. Beat often; each beat is one API call and zero messages.
+                stop.wait(8.0)
             self._typing(chat_id, ilink.TYPING_STOP)
 
         threading.Thread(target=loop, name=f"typing-{chat_id[-6:]}", daemon=True).start()
