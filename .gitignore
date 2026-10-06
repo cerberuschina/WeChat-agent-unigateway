@@ -3,6 +3,10 @@ data/
 account.json
 gateway.json
 *.local.json
+# 本机配置的备份 —— 我手滑提交过一次 gateway.json.bak-*，已从 tip 摘掉，别再进来
+*.bak
+*.bak-*
+gateway.json.*
 # join.py 改配置前留的备份
 *.bak-join-*
 # WorkBuddy 桌面版自己的配置目录（如果映射进项目目录）
