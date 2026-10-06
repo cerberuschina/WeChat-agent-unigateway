@@ -280,6 +280,19 @@ class GatewayApprovalTests(unittest.TestCase):
         self.gateway.approvals.request(agent="claude", peer="wx-user", title="等它")
         self.assertEqual(self.gateway.snapshot()["approvals"][0]["title"], "等它")
 
+    def test_the_last_peer_survives_a_restart(self):
+        """重启之后 agent 的问题也得有地方可去。"""
+        self.gateway.store.set_last_peer("wx-user")
+
+        from agent_gateway.config import load_config
+        from agent_gateway.gateway import Gateway
+
+        revived = Gateway(load_config(Path(self._tmp.name) / "cfg.json"), dry_run=True)
+        try:
+            self.assertEqual(revived._last_peer, "wx-user")
+        finally:
+            revived.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

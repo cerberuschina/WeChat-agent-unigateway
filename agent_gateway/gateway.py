@@ -65,8 +65,10 @@ class Gateway:
         # to *deny*, because an unanswered question is not permission.
         from .approvals import ApprovalBroker
         self.approvals = ApprovalBroker(ttl=float(cfg.delivery.approval_ttl_seconds))
-        # The chat an agent's question goes to when the agent does not name one.
-        self._last_peer: str = ""
+        # The chat an agent's question goes to when the agent does not name one:
+        # kept on disk, because a question must still have a destination after a
+        # restart (the phone that wrote to us last is the one to ask).
+        self._last_peer: str = self.store.last_peer()
 
     # -- account ---------------------------------------------------------
     def _resolve_account(self) -> bool:
@@ -282,6 +284,7 @@ class Gateway:
             return
         message_id = str(message.get("message_id") or "").strip()
         self._last_peer = sender
+        self.store.set_last_peer(sender)
         text = ilink.message_text(message)
         if not text:
             text = self._ingest_media(message, sender)   # 图片/文件：落盘后把路径交给 agent

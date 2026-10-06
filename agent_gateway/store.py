@@ -38,6 +38,7 @@ class StateStore:
         self.dir.mkdir(parents=True, exist_ok=True)
         self._sticky_path = self.dir / "chats.json"
         self._dedup_path = self.dir / "dedup.json"
+        self._peer_path = self.dir / "peer.json"
         self._dedup_ttl = dedup_ttl
         self._lock = threading.Lock()
         self._sticky: Dict[str, str] = _read_json(self._sticky_path, {}) or {}
@@ -51,6 +52,18 @@ class StateStore:
         with self._lock:
             self._sticky[chat_id] = agent
             _atomic_write(self._sticky_path, self._sticky)
+
+    # -- the chat we last heard from --------------------------------------
+    # An agent's question ("may I run this?") needs somewhere to go *after* a
+    # restart too, and the phone that wrote to us last is the one to ask.
+    def last_peer(self) -> Optional[str]:
+        return str((_read_json(self._peer_path, {}) or {}).get("last") or "")
+
+    def set_last_peer(self, chat_id: str) -> None:
+        if not chat_id:
+            return
+        with self._lock:
+            _atomic_write(self._peer_path, {"last": chat_id})
 
     # -- dedup -----------------------------------------------------------
     @staticmethod
