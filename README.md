@@ -56,7 +56,8 @@ Agent 那边什么都不用改，只要把微信的 base-url 指向 `http://127.
 详见 **[docs/VIRTUAL-ILINK.md](docs/VIRTUAL-ILINK.md)**。
 
 **卡在「需要批准」上的 agent**：给它一张**放行卡**——网关把「它想执行 xxx」发到你的微信，
-你回 `/approve <编号>` 才放行，不回就是拒绝（默认 180 秒）。`claude -p` 这种没人可问的会话
+你回 `/approve <编号>` 才放行，不回就是拒绝（默认 180 秒）。嫌烦就回 `/always`，
+这一轮剩下的不再问你（有期限，你下一句话就收回）。`claude -p` 这种没人可问的会话
 因此能在无人值守下干活，而决定权始终在你手里。详见 **[docs/APPROVALS.md](docs/APPROVALS.md)**。
 
 **② 直接后端（a2a / http / exec）** —— 网关主动去调 agent，等它返回。
@@ -113,6 +114,8 @@ python -m agent_gateway --config gateway.json
 | `帮我看下这个报错` | 发给**当前** agent（默认 hermes） |
 | `/c 修一下那个测试` | 这一条只发给 claude（一次性，不改默认） |
 | `/use claude` | 这个会话以后都发给 claude |
+| `/approve k7` `/reject k7` | 放行 / 拒绝 agent 等你点头的事（编号可省 = 最新那张） |
+| `/always` | 这一轮剩下的都别再问，全部放行 |
 | `/who` `/agents` `/help` | 看当前 / 看名单 / 看用法 |
 
 ## 配置

@@ -7,6 +7,8 @@ Grammar (agents configure their own prefix, e.g. ``h`` / ``c`` / ``w``):
 
     /c fix the flaky test        -> one-shot: send to the agent whose prefix is c
     /use claude                  -> sticky: this chat talks to claude from now on
+    /approve k7  /reject k7      -> answer an agent's "may I?" (see approvals.py)
+    /always                      -> allow every question left in this round
     /who                         -> which agent is this chat talking to
     /agents                      -> the roster
     /help                        -> this text
@@ -19,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-COMMANDS = ("help", "agents", "who", "use", "ping", "approve", "reject")
+COMMANDS = ("help", "agents", "who", "use", "ping", "approve", "reject", "always")
 
 
 @dataclass
@@ -57,6 +59,7 @@ def help_text(cfg, sticky: Optional[str]) -> str:
     lines += [
         "/use <名字> → 这个会话以后都发给它",
         "/approve <编号> / /reject <编号> → 放行或拒绝 agent 等你点头的那件事",
+        "/always → 这一轮剩下的都别再问，全部放行",
         "/agents 看名单　/who 看当前　/help 看这条",
         "",
         "名单：",
@@ -103,6 +106,11 @@ def route(text: str, cfg, *, sticky: Optional[str] = None) -> Decision:
             # so the decision is made there; the id is optional (newest wins).
             return Decision("approve" if name in ("approve", "yes", "ok") else "reject",
                             text=rest.strip(), note=f"approval:{name}")
+
+        if name == "always":
+            # "这一轮别再问我了" —— 一次把本轮剩下的问题全放行。
+            # 它是**明确说的**（不是沉默），但仍然有期限，见 approvals.allow_all。
+            return Decision("always", note="approval:always")
 
         # not a command -> maybe an agent prefix ("/c fix the test")
         agent = cfg.agent_for_prefix(name)

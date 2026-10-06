@@ -113,6 +113,11 @@ class DeliveryConfig:
     # How long an agent's "may I?" stays open on the phone. Silence expires to
     # *deny* — an unanswered question must never turn into permission.
     approval_ttl_seconds: int = 180
+    # How long a `/always` ("本轮全放行") keeps auto-approving. It is a ceiling,
+    # not the usual ending: the user's next message clears it sooner (gateway
+    # calls ``ApprovalBroker.clear_auto``). Both bounds exist because approval is
+    # the permissive direction — an unbounded "yes" eventually fires unattended.
+    always_window_seconds: float = 1800.0
 
 
 @dataclass

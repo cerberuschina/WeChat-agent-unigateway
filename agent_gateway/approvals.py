@@ -8,6 +8,9 @@ broker turns that dead end into a message the user can answer from WeChat —
 Design notes
 * ids are short and speakable; the user retypes them on a phone keyboard.
 * every request has a TTL and **expires to deny**: silence must never mean yes.
+* ``/always`` is the one *broad* answer, so it is bounded twice — by its own
+  window and by the user's next message (``clear_auto``). Being explicit is what
+  makes it legitimate; being bounded is what keeps it from becoming a default.
 * pure logic — no HTTP, no WeChat — so both halves stay testable offline.
 """
 from __future__ import annotations
@@ -21,6 +24,10 @@ PENDING = "pending"
 ALLOW = "allow"
 DENY = "deny"
 EXPIRED = "expired"
+
+# Why an approval was released without anyone reading it: the user had already
+# said "本轮全放行". Kept as a constant because it shows up in audit trails.
+ALLOW_ALL_REASON = "本轮已全部允许（/always）"
 
 # No 0/o/1/l/i: these ids get read off a phone screen and typed back by hand.
 ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz"
@@ -96,6 +103,9 @@ class ApprovalBroker:
         self._order: List[str] = []
         self._counter = 0
         self._max_history = max_history
+        # peer -> 截止时刻：「本轮全放行」（/always）还开着。到点自己失效，
+        # 用户下次开口也会清掉（见 clear_auto）。
+        self._auto: Dict[str, float] = {}
 
     # ---------------------------------------------------------------- writing
 
@@ -120,6 +130,14 @@ class ApprovalBroker:
             self._order.append(approval.id)
             while len(self._order) > self._max_history:
                 self._items.pop(self._order.pop(0), None)
+            # 「本轮全放行」还开着：这张卡连问都不用问，建的时候就已经放行了。
+            # 记下 decided_by=always，事后能查清是谁在什么时候松的口。
+            if now < self._auto.get(peer, 0.0):
+                approval.decision = ALLOW
+                approval.reason = ALLOW_ALL_REASON
+                approval.decided_at = now
+                approval.decided_by = "always"
+                self._cv.notify_all()
             return approval
 
     def resolve(self, approval_id: str, decision: str, *, by: str = "user",
@@ -137,6 +155,46 @@ class ApprovalBroker:
             approval.decided_by = by
             self._cv.notify_all()
             return approval
+
+    # ------------------------------------------------------- allow-all (/always)
+
+    def allow_all(self, peer: str, *, window: float, by: str = "user") -> List[Approval]:
+        """``/always``：这一轮剩下的问题不用再逐条问了。
+
+        两件事一起做——把**此刻**挂着的全放行，再记一个「此后 window 秒内的新问题
+        也直接放行」。窗口不能省：放行是宽的那个方向，一个永不过期的「永远同意」
+        迟早会在没人看着的时候生效。真正的到期条件是用户的下一条消息
+        （``clear_auto``），window 只是兜底的保险丝。
+
+        @returns 这次被一起放行的卡（调用方拿它回一句"放掉了哪几张"）。
+        """
+        self.expire()                      # 先把过期的清掉，别把 EXPIRED 洗成 ALLOW
+        now = self._clock()
+        with self._cv:
+            self._auto[peer] = now + max(0.0, float(window))
+            released: List[Approval] = []
+            for approval in self._items.values():
+                if approval.open and approval.peer == peer:
+                    approval.decision = ALLOW
+                    approval.reason = ALLOW_ALL_REASON
+                    approval.decided_at = now
+                    approval.decided_by = by
+                    released.append(approval)
+            if released:
+                self._cv.notify_all()
+            return released
+
+    def auto_allow_until(self, peer: str) -> float:
+        """这个 peer 的「本轮全放行」有效期到什么时候（0 = 没开）。"""
+        return self._auto.get(peer, 0.0)
+
+    def clear_auto(self, peer: Optional[str] = None) -> None:
+        """收回「本轮全放行」——用户又开口了，说明上一轮结束了。"""
+        with self._lock:
+            if peer is None:
+                self._auto.clear()
+            else:
+                self._auto.pop(peer, None)
 
     def expire(self) -> List[Approval]:
         """Close everything past its TTL — as a *deny*, never an implicit yes."""
@@ -200,7 +258,8 @@ class ApprovalBroker:
             if len(body) > 1200:
                 body = body[:1200] + "\n…（截断）"
             lines += ["", "```", body, "```"]
-        lines += ["", f"回 /approve {approval.id} 放行，/reject {approval.id} 拒绝。",
+        lines += ["", f"回 /approve {approval.id} 放行，/reject {approval.id} 拒绝；"
+                      f"嫌烦就回 /always，这一轮剩下的不再问你。",
                   f"（{left} 秒不回就算拒绝，我不会自己往下做。）"]
         return "\n".join(lines)
 

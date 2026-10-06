@@ -315,6 +315,10 @@ class Gateway:
         decision = router.route(text, self.cfg, sticky=self.store.sticky(sender))
         if decision.set_sticky:
             self.store.set_sticky(sender, decision.set_sticky)
+        # 用户又开口了 = 上一轮结束了：「本轮全放行」到此收回。
+        # 回答放行卡的那几条不算新的一轮，否则 /always 一句话就把自己关掉了。
+        if decision.kind not in ("approve", "reject", "always"):
+            self.approvals.clear_auto(sender)
         if decision.kind == "ignore":
             return
         if decision.kind == "reply":
@@ -324,7 +328,7 @@ class Gateway:
                 print(f"[dry-run] {suggestion_prefix(decision)} {decision.text}")
             return
 
-        if decision.kind in ("approve", "reject"):
+        if decision.kind in ("approve", "reject", "always"):
             self._resolve_approval(sender, decision)
             return
 
@@ -579,6 +583,12 @@ class Gateway:
         The agent is blocked in its own long poll, so this must be one message the
         user can act on — id, what it wants, and how long it waits.
         """
+        # With /always on, the card was released the moment it was created — there
+        # is nothing to ask, and a WeChat message saved is one more for the answer.
+        if not approval.open:
+            log.info("approval %s already released (allow-all), not asking %s",
+                     _safe(approval.id), _safe(approval.peer or self._last_peer))
+            return
         peer = approval.peer or self._last_peer
         if not peer:
             from .approvals import DENY
@@ -590,8 +600,12 @@ class Gateway:
         self._send(peer, self.approvals.describe(approval))
 
     def _resolve_approval(self, sender: str, decision) -> None:
-        """``/approve [id]`` and ``/reject [id]`` from the phone."""
+        """``/approve [id]``、``/reject [id]``、``/always`` 从手机上来。"""
         from .approvals import ALLOW, DENY, PENDING
+
+        if decision.kind == "always":
+            self._allow_all(sender)
+            return
 
         wanted = (decision.text or "").strip().lstrip("/")
         approval = self.approvals.get(wanted) if wanted else self.approvals.newest_pending(sender)
@@ -608,6 +622,25 @@ class Gateway:
         decided = self.approvals.get(approval.id) or approval
         log.info("approval %s -> %s (by %s)", _safe(decided.id), decided.decision, _safe(sender))
         self._send(sender, self.approvals.verdict_text(decided))
+
+    def _allow_all(self, sender: str) -> None:
+        """``/always``：这一轮剩下的问答不再逐条问。
+
+        它是**用户明确说的一句话**，不是沉默——这正是它敢一次全放行的理由。
+        但放行是宽的那个方向，所以收回的机制必须实在：用户下一句话就收回
+        （``_handle_message`` 里的 ``clear_auto``），另有 always_window_seconds 兜底。
+        """
+        window = float(self.cfg.delivery.always_window_seconds)
+        released = self.approvals.allow_all(sender, window=window, by=sender)
+        log.info("allow-all by %s: released %s, window %.0fs", _safe(sender),
+                 [a.id for a in released], window)
+        head = "✅ 这一轮全放行"
+        if released:
+            head += "（一次放掉了 " + "、".join(a.id for a in released) + "）"
+        minutes = max(1, int(round(window / 60)))
+        self._send(sender, f"{head}。\n"
+                           f"{minutes} 分钟内 agent 再要点头的事我直接放行，不再打断你；"
+                           f"你下一句话一到就自动收回。")
 
     def _forward_media_to_wechat(self, bind, items: list) -> None:
         """A virtual agent wants to send files: the gateway does the real upload.

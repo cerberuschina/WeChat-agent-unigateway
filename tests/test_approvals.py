@@ -106,6 +106,39 @@ class BrokerTests(unittest.TestCase):
         newest = self.broker.newest_pending("wx-user")
         self.assertEqual(newest.id, mine.id)
 
+    # -- /always: 本轮全放行 ------------------------------------------------
+
+    def test_always_releases_everything_already_waiting(self):
+        first, second = self.ask(title="跑测试"), self.ask(title="改文件")
+        released = self.broker.allow_all("wx-user", window=600, by="wx-user")
+        self.assertEqual({a.id for a in released}, {first.id, second.id},
+                         "一次要说清放掉了哪几张，不能只放最新那张")
+        self.assertEqual(self.broker.get(first.id).decision, ALLOW)
+        self.assertEqual(self.broker.get(second.id).decided_by, "wx-user")
+
+    def test_always_then_new_questions_are_answered_without_asking(self):
+        self.broker.allow_all("wx-user", window=600, by="wx-user")
+        later = self.ask(title="又一件事")
+        self.assertEqual(later.decision, ALLOW, "开着 /always 就不该再挂起一张卡")
+        self.assertEqual(later.decided_by, "always")
+        self.assertIn("/always", later.reason, "自动放行的得留下是谁松的口")
+
+    def test_always_expires_back_to_asking(self):
+        self.broker.allow_all("wx-user", window=600, by="wx-user")
+        self.now[0] += 601
+        self.assertEqual(self.ask(title="窗口过了之后").decision, PENDING,
+                         "窗口一过就得重新问人——自动放行不能永不过期")
+
+    def test_always_does_not_leak_to_another_peer(self):
+        self.broker.allow_all("wx-user", window=600, by="wx-user")
+        self.assertEqual(self.ask(peer="someone-else", title="别人的事").decision, PENDING)
+
+    def test_clearing_always_puts_the_questions_back(self):
+        self.broker.allow_all("wx-user", window=600, by="wx-user")
+        self.broker.clear_auto("wx-user")
+        self.assertEqual(self.ask(title="他又开口之后").decision, PENDING,
+                         "用户再说话就该收回，哪怕窗口没到")
+
 
 class ApprovalEndpointTests(unittest.TestCase):
     """虚拟服务端的 /agent/approval：问一句，然后挂着等答复。"""
@@ -237,6 +270,38 @@ class GatewayApprovalTests(unittest.TestCase):
         self.assertEqual(router.route("/reject", self.cfg).kind, "reject")
         self.assertEqual(router.route("/no 2m4", self.cfg).kind, "reject")
         self.assertIn("/approve", router.help_text(self.cfg, None))
+
+    def test_the_router_knows_always(self):
+        self.assertEqual(router.route("/always", self.cfg).kind, "always")
+        self.assertIn("/always", router.help_text(self.cfg, None))
+
+    def test_always_releases_the_open_card_and_then_stops_asking(self):
+        self.gateway._last_peer = "wx-user"
+        waiting = self.gateway.approvals.request(agent="claude", peer="wx-user",
+                                                 title="想跑 npm test")
+
+        self.gateway.handle({"from_user_id": "wx-user", "message_id": "m-a1",
+                             "item_list": [{"type": 1, "text_item": {"text": "/always"}}]})
+        self.assertEqual(self.gateway.approvals.get(waiting.id).decision, ALLOW)
+        self.assertTrue(any("全放行" in text for text in self.sent), self.sent)
+
+        # 下一张卡：不问人，也不发「等你一句话」那条
+        sent_before = len(self.sent)
+        later = self.gateway.approvals.request(agent="claude", peer="wx-user",
+                                               title="又想改文件")
+        self.gateway._approval_asked(types.SimpleNamespace(name="claude"), later)
+        self.assertEqual(later.decision, ALLOW)
+        self.assertEqual(len(self.sent), sent_before, "开着 /always 就不该再打扰人")
+
+    def test_saying_anything_else_takes_the_allow_all_back(self):
+        self.gateway.handle({"from_user_id": "wx-user", "message_id": "m-a2",
+                             "item_list": [{"type": 1, "text_item": {"text": "/always"}}]})
+        self.assertGreater(self.gateway.approvals.auto_allow_until("wx-user"), 0)
+
+        self.gateway.handle({"from_user_id": "wx-user", "message_id": "m-a3",
+                             "item_list": [{"type": 1, "text_item": {"text": "接着干"}}]})
+        self.assertEqual(self.gateway.approvals.auto_allow_until("wx-user"), 0,
+                         "用户又开口 = 上一轮结束了")
 
     def test_the_question_reaches_the_chat_and_the_answer_releases_the_agent(self):
         self.gateway._last_peer = "wx-user"        # 上一条消息是谁发的
