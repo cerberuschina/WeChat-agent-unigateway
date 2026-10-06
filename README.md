@@ -55,6 +55,10 @@ Agent 那边什么都不用改，只要把微信的 base-url 指向 `http://127.
 想亲眼看一遍：`python examples/virtual_loop_demo.py`（真客户端 + 虚拟服务端，不联网）。
 详见 **[docs/VIRTUAL-ILINK.md](docs/VIRTUAL-ILINK.md)**。
 
+**卡在「需要批准」上的 agent**：给它一张**放行卡**——网关把「它想执行 xxx」发到你的微信，
+你回 `/approve <编号>` 才放行，不回就是拒绝（默认 180 秒）。`claude -p` 这种没人可问的会话
+因此能在无人值守下干活，而决定权始终在你手里。详见 **[docs/APPROVALS.md](docs/APPROVALS.md)**。
+
 **② 直接后端（a2a / http / exec）** —— 网关主动去调 agent，等它返回。
 
 ```
@@ -186,11 +190,12 @@ examples/virtual_loop_demo.py   一条命令跑完"虚拟 iLink"全流程（真�
 bridges/           可选桥：bridges/electron_cdp.py 用 CDP 驱动只有桌面版的 agent
 docs/VIRTUAL-ILINK.md       虚拟 iLink 的设计、接法、批准流程、边界
 docs/DASHBOARD.md           控制台：看状态、批准接入（本机网页，零依赖）
+docs/APPROVALS.md           放行卡：agent 在手机上问一句「可以吗」，沉默=拒绝
 docs/REMOTE-AGENTS.md       非本机 agent 接入：bind_key、上传/下载、安全边界
 docs/PROTOCOL.md            iLink 协议实测要点
 docs/BACKENDS-WORKBUDDY.md  WorkBuddy 实测结论 + 两条接法
 docs/SWITCH.md              把微信切到网关的步骤（含回滚）
-tests/             214 项离线测试
+tests/             255 项离线测试
 ```
 
 ## 已知限制 / Roadmap

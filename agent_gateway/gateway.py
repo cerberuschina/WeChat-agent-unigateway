@@ -60,6 +60,13 @@ class Gateway:
         self.log_ring = None
         self.dashboard = None
         self.virtual: Optional[VirtualILinkServer] = None
+        # Questions an agent needs a human to answer. The broker lives here so the
+        # phone, the console and the router all look at one list; silence expires
+        # to *deny*, because an unanswered question is not permission.
+        from .approvals import ApprovalBroker
+        self.approvals = ApprovalBroker(ttl=float(cfg.delivery.approval_ttl_seconds))
+        # The chat an agent's question goes to when the agent does not name one.
+        self._last_peer: str = ""
 
     # -- account ---------------------------------------------------------
     def _resolve_account(self) -> bool:
@@ -274,6 +281,7 @@ class Gateway:
         if not sender or (self.client and sender == self.client.account_id):
             return
         message_id = str(message.get("message_id") or "").strip()
+        self._last_peer = sender
         text = ilink.message_text(message)
         if not text:
             text = self._ingest_media(message, sender)   # 图片/文件：落盘后把路径交给 agent
@@ -311,6 +319,10 @@ class Gateway:
                 self._send(sender, decision.text)
             else:
                 print(f"[dry-run] {suggestion_prefix(decision)} {decision.text}")
+            return
+
+        if decision.kind in ("approve", "reject"):
+            self._resolve_approval(sender, decision)
             return
 
         agent = self.cfg.agent(decision.agent)
@@ -416,6 +428,8 @@ class Gateway:
             on_outbound=self._forward_to_wechat,
             on_outbound_items=self._forward_media_to_wechat,
             on_typing=self._agent_typing,
+            approvals=self.approvals,
+            on_approval=self._approval_asked,
             bind_key=self.cfg.virtual.bind_key,
             public_url=self.cfg.virtual.public_url,
             allow_cidrs=self.cfg.virtual.allow_cidrs,
@@ -507,6 +521,7 @@ class Gateway:
         return {
             "running": True,
             "account": _safe(self.client.account_id if self.client else self.cfg.account.account_id),
+            "approvals": self.approvals.snapshot(),
             "base_url": self.cfg.account.base_url,
             "virtual_url": self.virtual.base_url() if self.virtual else "",
             "default_agent": self.cfg.default_agent,
@@ -553,6 +568,43 @@ class Gateway:
             self.dashboard = None
             return
         print(f"\n控制台：{self.dashboard.base_url()}（浏览器打开；默认只允许本机访问）")
+
+    # -- approvals: the agent asks, the human answers on the phone ------------
+    def _approval_asked(self, bind, approval) -> None:
+        """Put an agent's question on the phone, then leave it open.
+
+        The agent is blocked in its own long poll, so this must be one message the
+        user can act on — id, what it wants, and how long it waits.
+        """
+        peer = approval.peer or self._last_peer
+        if not peer:
+            from .approvals import DENY
+            self.approvals.resolve(approval.id, DENY, by="gateway",
+                                   reason="没有可以问的联系人")
+            log.warning("approval %s from %s has no peer to ask", _safe(approval.id), bind.name)
+            return
+        log.info("approval %s -> asking %s", _safe(approval.id), _safe(peer))
+        self._send(peer, self.approvals.describe(approval))
+
+    def _resolve_approval(self, sender: str, decision) -> None:
+        """``/approve [id]`` and ``/reject [id]`` from the phone."""
+        from .approvals import ALLOW, DENY, PENDING
+
+        wanted = (decision.text or "").strip().lstrip("/")
+        approval = self.approvals.get(wanted) if wanted else self.approvals.newest_pending(sender)
+        if approval is None:
+            self._send(sender, f"没有这个编号（或已过期）：{wanted}" if wanted
+                       else "现在没有等你点头的事。")
+            return
+        if approval.decision != PENDING:
+            self._send(sender, self.approvals.verdict_text(approval))   # answered twice
+            return
+        self.approvals.resolve(approval.id,
+                               ALLOW if decision.kind == "approve" else DENY,
+                               by=sender)
+        decided = self.approvals.get(approval.id) or approval
+        log.info("approval %s -> %s (by %s)", _safe(decided.id), decided.decision, _safe(sender))
+        self._send(sender, self.approvals.verdict_text(decided))
 
     def _forward_media_to_wechat(self, bind, items: list) -> None:
         """A virtual agent wants to send files: the gateway does the real upload.

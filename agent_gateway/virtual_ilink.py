@@ -191,6 +191,8 @@ class VirtualILinkServer:
                  on_outbound: Optional[Callable[[VirtualBind, str], None]] = None,
                  on_outbound_items: Optional[Callable[[VirtualBind, List[Dict[str, Any]]], None]] = None,
                  on_typing: Optional[Callable[[VirtualBind, int], None]] = None,
+                 approvals: Optional[Any] = None,
+                 on_approval: Optional[Callable[[VirtualBind, Any], None]] = None,
                  bind_key: str = "", public_url: str = "",
                  allow_cidrs: Optional[List[str]] = None,
                  admin_cidrs: Optional[List[str]] = None,
@@ -209,6 +211,10 @@ class VirtualILinkServer:
         # Heartbeats from an agent ("still working") — the gateway holds the real
         # typing indicator; nothing is sent to WeChat for these.
         self.on_typing = on_typing
+        # Questions the agent needs a human to answer ("may I run this?"). The
+        # gateway owns the broker, so the phone *and* the console see one list.
+        self.approvals = approvals
+        self.on_approval = on_approval
         # Remote agents: a pre-shared bind key, and the address they should use to
         # fetch media they cannot read from this machine's disk.
         self.bind_key = bind_key or ""
@@ -613,6 +619,27 @@ def _make_handler(server: VirtualILinkServer):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if path.startswith("/agent/approval/"):
+                # The blocked agent waits here; /wait long-polls like the rest of
+                # the iLink API, so an agent needs no new machinery to ask a human.
+                if not server._bind_for_token(self._token()):
+                    self._send({"ret": ERR_SESSION_EXPIRED, "errmsg": "需要虚拟身份的 token"},
+                               status=401)
+                    return
+                if not server.approvals:
+                    self._send({"ok": False, "error": "approvals are disabled"}, status=404)
+                    return
+                rest = path[len("/agent/approval/"):]
+                if rest.endswith("/wait"):
+                    approval = server.approvals.wait(
+                        rest[:-len("/wait")], timeout=float(params.get("timeout") or 60))
+                else:
+                    approval = server.approvals.get(rest)
+                if not approval:
+                    self._send({"ok": False, "error": "Not Found"}, status=404)
+                    return
+                self._send({"ret": RET_OK, "approval": approval.as_dict()})
+                return
             if path == "/admin/binds":
                 self._send({"ok": True, "binds": server.binds()})
                 return
@@ -682,6 +709,29 @@ def _make_handler(server: VirtualILinkServer):
             bind = server._bind_for_token(self._token())
             if not bind or not bind.confirmed:
                 self._send({"ret": ERR_SESSION_EXPIRED, "errmsg": "virtual: unknown or unconfirmed token"})
+                return
+
+            if path == "/agent/approval":
+                # An agent that is about to do something it may not do asks *here*
+                # instead of dying quietly: the gateway puts the question on the
+                # phone, and the same agent long-polls /agent/approval/<id>/wait.
+                if not server.approvals:
+                    self._send({"ret": ERR_BAD_REQUEST,
+                                "errmsg": "virtual gateway: approvals are disabled"})
+                    return
+                approval = server.approvals.request(
+                    agent=bind.name,
+                    peer=str(payload.get("peer") or ""),
+                    title=str(payload.get("title") or ""),
+                    detail=str(payload.get("detail") or ""),
+                    kind=str(payload.get("kind") or "command"),
+                    ttl=payload.get("ttl") or None,
+                )
+                server._log(f"virtual: 「{bind.name}」请求放行 {approval.id}（{approval.kind}）"
+                            f"：{approval.title[:60]}")
+                if server.on_approval:
+                    server.on_approval(bind, approval)
+                self._send({"ret": RET_OK, "id": approval.id, "ttl": server.approvals.ttl})
                 return
 
             if path == "/ilink/bot/getupdates":

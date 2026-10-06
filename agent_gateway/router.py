@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-COMMANDS = ("help", "agents", "who", "use", "ping")
+COMMANDS = ("help", "agents", "who", "use", "ping", "approve", "reject")
 
 
 @dataclass
@@ -56,6 +56,7 @@ def help_text(cfg, sticky: Optional[str]) -> str:
             lines.append(f"/{agent.prefix} 内容 → 这一条只发给「{agent.display}」")
     lines += [
         "/use <名字> → 这个会话以后都发给它",
+        "/approve <编号> / /reject <编号> → 放行或拒绝 agent 等你点头的那件事",
         "/agents 看名单　/who 看当前　/help 看这条",
         "",
         "名单：",
@@ -96,6 +97,12 @@ def route(text: str, cfg, *, sticky: Optional[str] = None) -> Decision:
                 return Decision("reply", text=f"没有这个 agent：{wanted}。有的是：{known}", note="use-unknown")
             return Decision("reply", text=f"好，这个会话以后发给「{agent.display}」。[{agent.name}]",
                             note="use", set_sticky=agent.name)
+
+        if name in ("approve", "yes", "ok", "reject", "no"):
+            # Answering an agent's "may I?" — the gateway owns the pending list,
+            # so the decision is made there; the id is optional (newest wins).
+            return Decision("approve" if name in ("approve", "yes", "ok") else "reject",
+                            text=rest.strip(), note=f"approval:{name}")
 
         # not a command -> maybe an agent prefix ("/c fix the test")
         agent = cfg.agent_for_prefix(name)

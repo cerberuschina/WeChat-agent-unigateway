@@ -331,6 +331,7 @@ def main(argv: list | None = None) -> int:
             log(f"← {sender}: {text[:80]}")
             started = time.time()
             session = sessions.get(sender, "")
+            export_approval_env(client, sender)   # 工具钩子靠这几个变量找回网关
             answer = run_with_progress(runner, text, args, session, sender, client, message)
             answer, new_session = extract_session(answer)
             answer, media_paths = extract_media_marks(answer)
@@ -390,6 +391,49 @@ def _no_proxy_opener():
     import urllib.request as _urlrequest
 
     return _urlrequest.build_opener(_urlrequest.ProxyHandler({}))
+
+
+def ask_approval(client, peer: str, title: str, detail: str = "", *, kind: str = "command",
+                 ttl: float = 180, wait: float = 0, timeout: float = 30) -> dict:
+    """Ask the human through the gateway and (by default) wait for the answer.
+
+    This is the one call an agent needs to stop dying on "requires approval": the
+    gateway puts the question on the phone, the user answers there, and the
+    verdict comes back as ``{"decision": "allow"|"deny"|"expired", ...}``.
+    """
+    import urllib.request
+
+    base = str(getattr(client, "base_url", "") or "").rstrip("/")
+    token = str(getattr(client, "token", "") or "")
+    request = urllib.request.Request(
+        f"{base}/agent/approval",
+        data=json.dumps({"peer": peer, "title": title, "detail": detail,
+                         "kind": kind, "ttl": ttl}, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+    with _no_proxy_opener().open(request, timeout=timeout) as response:
+        started = json.loads(response.read().decode("utf-8") or "{}")
+    approval_id = str(started.get("id") or "")
+    if not approval_id:
+        raise RuntimeError(f"网关没有受理这次放行请求：{started}")
+    waiting = float(wait or 0) or (float(ttl) + 20)
+    query = urllib.request.Request(
+        f"{base}/agent/approval/{approval_id}/wait?timeout={int(waiting)}",
+        headers={"Authorization": f"Bearer {token}"})
+    with _no_proxy_opener().open(query, timeout=waiting + 30) as response:
+        answered = json.loads(response.read().decode("utf-8") or "{}")
+    return dict(answered.get("approval") or {})
+
+
+def export_approval_env(client, peer: str, ttl: float = 180) -> None:
+    """Publish the gateway coordinates for anything the runner spawns.
+
+    A tool hook (see ``hooks/claude_approval_hook.py``) runs as a child process and
+    cannot ask *us* for the token, so it inherits these instead.
+    """
+    os.environ["AGW_APPROVAL_URL"] = str(getattr(client, "base_url", "") or "")
+    os.environ["AGW_TOKEN"] = str(getattr(client, "token", "") or "")
+    os.environ["AGW_PEER"] = peer or ""
+    os.environ["AGW_APPROVAL_TTL"] = str(int(ttl))
 
 
 def upload_blob(client, name: str, data: bytes) -> str:

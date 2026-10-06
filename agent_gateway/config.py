@@ -74,6 +74,9 @@ class DeliveryConfig:
     ack_template: str = "已转给 {label}，算完就回。"
     error_template: str = "「{label}」这次没跑通：{error}"
     queue_template: str = "队列里还有 {n} 条，按顺序回。"
+    # How long an agent's "may I?" stays open on the phone. Silence expires to
+    # *deny* — an unanswered question must never turn into permission.
+    approval_ttl_seconds: int = 180
 
 
 @dataclass
