@@ -66,6 +66,10 @@ class AgentConfig:
 @dataclass
 class DeliveryConfig:
     max_chars_per_message: int = 1800
+    # WeChat lets a bot send ~10 messages before the user replies again; spend the
+    # budget on the answer, never on chatter.
+    max_messages_per_turn: int = 10
+    reserve_for_answer: int = 2
     ack: bool = True
     ack_template: str = "已转给 {label}，算完就回。"
     error_template: str = "「{label}」这次没跑通：{error}"

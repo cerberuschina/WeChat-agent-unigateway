@@ -102,8 +102,10 @@ def run_with_progress(runner: list[str], text: str, args, session: str, sender: 
     """Run the agent while telling the peer it is still alive.
 
     WeChat cannot edit a sent message, so "streaming" here means: the gateway
-    keeps the typing indicator on, and we post a short progress note every
-    ``--progress-every`` seconds until the answer exists.
+    holds the typing indicator, and we post a few progress notes until the answer
+    exists. Notes are deliberately few and back off (60s → 120s → 240s): WeChat
+    allows a bot only ~10 messages before the user replies, and the answer must
+    not be the thing that runs out of budget.
     """
     holder: dict = {}
 
@@ -119,17 +121,20 @@ def run_with_progress(runner: list[str], text: str, args, session: str, sender: 
     worker = threading.Thread(target=work, name="runner", daemon=True)
     started = time.time()
     worker.start()
-    every = max(float(args.progress_every), 0.0)
+    delay = max(float(args.progress_every), 0.0)
+    notes = 0
     while worker.is_alive():
-        worker.join(timeout=every or 5.0)
-        if not worker.is_alive() or not every:
-            continue
+        worker.join(timeout=delay or 5.0)
+        if not worker.is_alive():
+            break
+        if not delay or notes >= int(args.max_progress_notes):
+            continue                       # keep waiting quietly, do not spend the budget
         elapsed = time.time() - started
         note = f"⏳ 还在跑（已 {int(elapsed // 60)} 分 {int(elapsed % 60):02d} 秒），完事我把结果发上来。"
         try:
             client.send_text(sender, note, context_token=message.get("context_token"))
-        except ilink.ILinkError as exc:
-            log(f"（进度发不出去：{exc}）")
+            notes += 1
+            delay = min(delay * 2, 600.0)   # back off: 60s → 120s → 240s …
         except Exception as exc:  # noqa: BLE001
             log(f"（进度发不出去：{exc}）")
     return holder.get("answer", "（没有结果）")
@@ -198,8 +203,11 @@ def main(argv: list | None = None) -> int:
                         help="per-message timeout (seconds); a long agent run must not be cut short")
     parser.add_argument("--max-chars", type=int, default=0,
                         help="0 = send the answer whole and let the gateway render/split for WeChat")
-    parser.add_argument("--progress-every", type=float, default=45.0,
-                        help="while the agent works, post a 「还在跑」 note every N seconds (0 = off)")
+    parser.add_argument("--progress-every", type=float, default=60.0,
+                        help="first 「还在跑」 note after N seconds, then doubling (0 = off)")
+    parser.add_argument("--max-progress-notes", type=int, default=3,
+                        help="how many progress notes at most: WeChat allows a bot ~10 "
+                             "messages before the user replies, and the answer needs the rest")
     parser.add_argument("--creds", default="", help="where to keep the virtual identity")
     parser.add_argument("--session-store", default="",
                         help="where to keep per-peer session ids (default: next to --creds); "

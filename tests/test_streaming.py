@@ -133,8 +133,9 @@ class ProgressNoteTests(unittest.TestCase):
         cwd = ""
         timeout = 30.0
 
-        def __init__(self, every):
+        def __init__(self, every, max_notes=3):
             self.progress_every = every
+            self.max_progress_notes = max_notes
 
     def test_progress_notes_are_sent_while_the_runner_works(self):
         sent = []
@@ -170,6 +171,62 @@ class ProgressNoteTests(unittest.TestCase):
         answer = client_mod.run_with_progress(runner, "任务", self.Args(0), "", "wx-user",
                                               Sink(), {})
         self.assertIn("跑挂了", answer)
+
+
+class MessageBudgetTests(unittest.TestCase):
+    """WeChat allows a bot only ~10 messages before the user replies again.
+
+    Progress notes, acknowledgements and answer bubbles all come out of that
+    budget, so the answer must never be the thing that cannot be delivered.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.gateway = virtual_gateway(Path(self._tmp.name))
+
+    def tearDown(self):
+        self.gateway.shutdown()
+        self._tmp.cleanup()
+
+    def sent(self):
+        return [text for _chat, text in self.gateway.client.sent]
+
+    def test_the_cap_is_never_exceeded(self):
+        for i in range(15):
+            self.gateway._send("wx-user", f"第 {i} 条")
+        cap = self.gateway.cfg.delivery.max_messages_per_turn
+        self.assertEqual(len(self.sent()), cap)
+        self.assertIn("wx-user", self.gateway._pending_output, "发不出去的不能丢")
+
+    def test_a_long_answer_keeps_its_tail_for_the_next_turn(self):
+        for i in range(8):                     # 8 slots of 10 used
+            self.gateway._send("wx-user", f"占位 {i}")
+        self.gateway._send("wx-user", "正文。\n\n" + "长" * 6000)
+
+        self.assertLessEqual(len(self.sent()), 10)
+        self.assertTrue(any("还差" in text for text in self.sent()), self.sent()[-1])
+        self.assertIn("长", self.gateway._pending_output["wx-user"])
+
+    def test_the_next_inbound_message_releases_the_tail(self):
+        self.gateway._turn_counts["wx-user"] = 10        # budget spent this turn
+        self.gateway._send("wx-user", "重要结论")
+        self.assertNotIn("重要结论", self.sent())
+        self.assertEqual(self.gateway._pending_output["wx-user"], "重要结论")
+
+        self.gateway.handle({"from_user_id": "wx-user", "message_id": "m-2",
+                             "item_list": [{"type": 1, "text_item": {"text": "/help"}}]})
+
+        self.assertIn("重要结论", self.sent(), "用户一说话就该把欠的补上")
+        self.assertEqual(self.gateway._turn_counts.get("wx-user", 0), 2,
+                         "新的一轮从零开始：补发的尾巴 + /help 的回复")
+
+    def test_progress_notes_stop_before_they_eat_the_answer(self):
+        self.gateway._turn_counts["wx-user"] = 8         # only the reserve is left
+        self.gateway._send("wx-user", "⏳ 还在跑（已 1 分 00 秒）")
+        self.assertEqual(self.sent(), [], "进度提示不该占用正文的额度")
+
+        self.gateway._send("wx-user", "答案")
+        self.assertEqual(self.sent(), ["答案"], "额度留给正文")
 
 
 if __name__ == "__main__":

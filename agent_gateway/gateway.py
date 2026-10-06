@@ -51,6 +51,10 @@ class Gateway:
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="agent")
         self._typing_tickets: Dict[str, str] = {}
         self._typing_loops: Dict[str, threading.Event] = {}
+        # WeChat lets a bot send only ~10 messages before the user replies again,
+        # so count them per peer and keep the tail for the next turn.
+        self._turn_counts: Dict[str, int] = {}
+        self._pending_output: Dict[str, str] = {}
         self.virtual: Optional[VirtualILinkServer] = None
 
     # -- account ---------------------------------------------------------
@@ -108,10 +112,28 @@ class Gateway:
             log.info("[dry-run] -> %s: %s", _safe(chat_id), text[:200].replace("\n", " / "))
             print(f"[dry-run] -> {_safe(chat_id)}: {text}")
             return
+        budget = max(1, int(self.cfg.delivery.max_messages_per_turn))
+        left = max(0, budget - self._turn_counts.get(chat_id, 0))
+        # WeChat allows a bot only ~10 messages before the user replies. A progress
+        # note must never eat the slots the actual answer needs.
+        if text.lstrip().startswith("⏳") and left <= max(1, int(self.cfg.delivery.reserve_for_answer)):
+            log.info("dropped a progress note for %s: %d slot(s) left this turn", _safe(chat_id), left)
+            return
         context_token = self.client.context_token(chat_id)
         # WeChat renders no Markdown and refuses oversized items, so rendering and
         # splitting belong to the channel layer — the agent sends what it means.
         chunks = markdown.prepare(text, self.cfg.delivery.max_chars_per_message)
+        if len(chunks) > left:
+            if left <= 1:
+                self._queue_pending(chat_id, text)
+                log.warning("no budget left for %s (%d chars queued to the next turn)",
+                            _safe(chat_id), len(text))
+                return
+            head, rest = chunks[:left - 1], chunks[left - 1:]
+            tail = "\n\n".join(rest)
+            self._queue_pending(chat_id, tail)
+            chunks = head + [f"（还差 {len(tail)} 字没发完，回我一句我接着发）"]
+            log.info("trimmed an answer for %s to fit the per-turn message budget", _safe(chat_id))
         for chunk in chunks:
             try:
                 self.client.send_text(chat_id, chunk, context_token=context_token)
@@ -125,6 +147,15 @@ class Gateway:
                 except ilink.ILinkError as retry_exc:
                     log.error("send failed twice to %s: %s", _safe(chat_id), retry_exc)
                     raise
+            self._turn_counts[chat_id] = self._turn_counts.get(chat_id, 0) + 1
+
+    def _queue_pending(self, chat_id: str, text: str) -> None:
+        """Keep what did not fit this turn; the peer's next message releases it."""
+        existing = self._pending_output.get(chat_id, "")
+        self._pending_output[chat_id] = f"{existing}\n\n{text}".strip() if existing else text
+
+    def _take_pending(self, chat_id: str) -> str:
+        return self._pending_output.pop(chat_id, "")
 
     def _typing(self, chat_id: str, state: int) -> None:
         if self.dry_run or self.client is None:
@@ -190,6 +221,12 @@ class Gateway:
         if text and self.store.is_duplicate(f"text:{sender}:{self.store.fingerprint(text)}"):
             log.debug("duplicate content from %s", _safe(sender))
             return
+        # A message from the peer opens a fresh budget (WeChat's per-turn cap), and
+        # whatever the previous turn could not deliver goes out first.
+        self._turn_counts.pop(sender, None)
+        pending = self._take_pending(sender)
+        if pending:
+            self._send(sender, pending)
         if not text:
             if not self.dry_run:
                 self._send(sender, "现在只认文字消息（图片/语音还没接）。")
