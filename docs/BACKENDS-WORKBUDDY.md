@@ -79,9 +79,45 @@ python bridges/electron_cdp.py --profile bridges/profiles/workbuddy.json --list
 
 ## 三、给网关的动作清单（做完打勾）
 
-- [ ] 决定走 A 还是 B
-- [ ] 走 A：确认 `codebuddy`（或实际命令）存在，填进 `gateway.json`
+- [x] 决定走 A 还是 B —— **都不用**：5.6.2 里它自己带了一个 weixin claw 插件，走「虚拟
+      iLink + 网关签发 token」更省事（下面第四节）
+- [x] 走 A：确认 `codebuddy`（或实际命令）存在，填进 `gateway.json`
 - [ ] 走 B：`pip install websocket-client`；带 `--remote-debugging-port=9222` 重启 WorkBuddy；
       调 `profiles/workbuddy.json` 的三个选择器；`--text 你好` 跑通
-- [ ] `enabled: true`，`python -m agent_gateway --dry-run --once` 看路由
+- [x] `enabled: true`，`python -m agent_gateway --dry-run --once` 看路由
 - [ ] 微信里 `/w 你好` 试一发
+
+## 四、实测补充（2026-10-06，5.6.2）：它自己就是个 ClawBot 客户端
+
+「微信助理」那一屏不是腾讯的什么专有接口，就是 **iLink / ClawBot**：asar 里
+`packages/workbuddy-server/src/claw/plugins/weixin/` 有完整实现，取码走的正是
+`GET {apiBaseUrl}/ilink/bot/get_bot_qrcode?bot_type=3`，扫码后按
+`get_qrcode_status` 拿 `bot_token` —— 和本网关 `login.py`、`clients/ilink_agent_client.py`
+是同一套协议。
+
+两个关键事实：
+
+1. **取码 URL 写死**：`ClawService.startWeixinQrLogin()` 调的是无参
+   `startWeixinQrLogin(apiBaseUrl = DEFAULT_API_BASE_URL)`（`https://ilinkai.weixin.qq.com`）。
+   → 它**永远扫不到我们发的码**，只能「它先绑真微信、我们再接管」或者「我们直接发它一个身份」。
+2. **收发 URL 可覆盖**：`WeixinClawBotConfigAdapter.resolveAccount()` 里
+   `baseUrl = rawConfig.baseUrl || DEFAULT`，之后每次调用都拼
+   `${credential.apiBaseUrl}/ilink/bot/…`，Authorization 是 `Bearer <botToken>`。
+   → 只要把渠道配置里的 `baseUrl` 指到网关，它就以普通客户端身份连上来了。
+
+渠道配置在 **`~/.workbuddy/settings.json`** 的 `claw.channels.weixinClawBot`
+（`botToken / accountId / channelId / userId / baseUrl`；`claw.users.<uid>.channels` 是
+按用户分的那一份，`claw.channels` 是 legacy，未登录/未认领时按 legacy 算）。
+
+于是接法只有一条命令：
+
+```bash
+python join.py workbuddy        # 登记 agent + 发 token + 写上面那份配置 + 重启网关
+```
+
+它拿到的虚拟号形如 `virt-workbuddy…@im.bot`，之后微信里的 `/w 你好` 就归它。想撤：从
+`gateway.json` 的 `virtual.accept_tokens` 删掉那一行、重启网关（它会收到 `ret=-14`）。
+
+> ⚠️ 别在 WorkBuddy 界面里点「连接/扫码」：它的码是向腾讯要的，扫完会把我们写进去的
+> 那份渠道配置覆盖成腾讯绑定。要重连就跑一次 `python join.py workbuddy`。
+

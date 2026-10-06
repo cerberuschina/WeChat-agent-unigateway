@@ -70,6 +70,9 @@ Agent 那边什么都不用改，只要把微信的 base-url 指向 `http://127.
 想用哪种，取决于 agent 自己有什么：**有微信接入能力 → 用①；只有接口/命令行 → 用②。**
 两种可以混着配（`agents` 里每个 agent 的 `type` 决定）。
 
+不想自己判、也不想手改 JSON：`python join.py <agent>` —— 每种 agent 一个 profile，
+它替你改配置（先备份）、重启、验证。见 **[docs/JOIN.md](docs/JOIN.md)**。
+
 ## 特点
 
 - **零依赖**：只用 Python 标准库（`urllib` + 线程），Python 3.9+ 直接跑。
@@ -92,6 +95,9 @@ python login.py                 # 凭证写入 data/account.json（已在 .gitig
 
 # 3) 配置你的 agent
 cp gateway.example.json gateway.json    # 改 agents 那一段
+
+# 3b) 或者让脚本替你改：把一个 agent 接进来（登记 + 开一条进来的路 + 重启 + 验证）
+python join.py workbuddy                # --list 看现成的；--dry-run / --status 都离线
 
 # 4) 无副作用地验证路由（不碰微信，不调远端）
 python -m agent_gateway --dry-run --once
@@ -132,6 +138,18 @@ python -m agent_gateway --config gateway.json
 
 `account` 留空时会去读 `data/account.json`（`login.py` 写的那个）。想换绑：删掉它重新扫码。
 
+虚拟接入那一段（谁可以自己取码、谁要我们发码）：
+
+```jsonc
+"virtual": {
+  "enabled": true, "host": "127.0.0.1", "port": 18500,
+  "auto_approve": ["claude", "hermes"],              // 它们自己取码，不用人工批准
+  "accept_tokens": {                                 // 我们发码给它们（密钥在 data/ 里）
+    "workbuddy": "file:data/workbuddy-token.txt"
+  }
+}
+```
+
 ### 三种后端
 
 | type | 用途 | 必填 |
@@ -165,7 +183,7 @@ python -m agent_gateway --config gateway.json
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -t .     # 214 项，全部离线（不联网、不碰微信）
+python -m unittest discover -s tests -t .     # 282 项，全部离线（不联网、不碰微信）
 ```
 
 测试覆盖：路由语法（含命令与 agent 前缀冲突）、A2A 回复提取、exec 后端（argv/stdin/超时/非零退出）、
@@ -185,6 +203,7 @@ agent_gateway/
   store.py         会话 sticky agent + 去重窗口
   gateway.py       主循环：收 → 路由 → 派发（虚拟队列 或 直接后端）→ 回
 login.py           扫码绑定这个网关自己的真微信号
+join.py            把一个 agent 接进来（每种 agent 一个 profile：`python join.py workbuddy`）
 clients/ilink_agent_client.py   把任意 agent 挂到微信上的客户端（扫码 → 长轮询 → 跑命令 → 回话）
 examples/virtual_loop_demo.py   一条命令跑完"虚拟 iLink"全流程（真客户端，不联网）
 bridges/           可选桥：bridges/electron_cdp.py 用 CDP 驱动只有桌面版的 agent
@@ -194,8 +213,9 @@ docs/APPROVALS.md           放行卡：agent 在手机上问一句「可以吗�
 docs/REMOTE-AGENTS.md       非本机 agent 接入：bind_key、上传/下载、安全边界
 docs/PROTOCOL.md            iLink 协议实测要点
 docs/BACKENDS-WORKBUDDY.md  WorkBuddy 实测结论 + 两条接法
+docs/JOIN.md               一键接入：每种 agent 一条命令、改了什么、怎么排错
 docs/SWITCH.md              把微信切到网关的步骤（含回滚）
-tests/             255 项离线测试
+tests/             282 项离线测试
 ```
 
 ## 已知限制 / Roadmap

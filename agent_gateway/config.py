@@ -20,6 +20,42 @@ class ConfigError(RuntimeError):
     """Raised when the config file is missing or unusable."""
 
 
+def read_token_source(source: str) -> str:
+    """Resolve a token *source* to the token itself.
+
+    ``file:path`` reads a (trimmed) file, ``env:VAR`` reads the environment, and
+    anything else is the literal token. Sources exist so a shared secret lives in
+    a file with 0600 rather than inside ``gateway.json`` — ``join.py`` writes
+    ``file:data/<agent>-token.txt`` when it hands an agent a token we minted.
+    """
+    src = (source or "").strip()
+    if not src:
+        return ""
+    if src.startswith("file:"):
+        try:
+            return Path(src[len("file:"):].strip()).expanduser().read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+    if src.startswith("env:"):
+        return os.environ.get(src[len("env:"):].strip(), "").strip()
+    return src
+
+
+def _resolve_token_source(source: str, base: Path) -> str:
+    """把 ``file:`` 的相对路径拧成相对**配置文件**的绝对路径。
+
+    ``data/foo-token.txt`` 这种写法在网关以别的 cwd 启动时会读到别的文件（或读不到），
+    accept_tokens 里的路径按配置文件所在目录解析，和 ``data_dir`` 一个规矩。
+    """
+    src = (source or "").strip()
+    if not src.startswith("file:"):
+        return src
+    raw = Path(src[len("file:"):].strip()).expanduser()
+    if not raw.is_absolute():
+        raw = base / raw
+    return f"file:{raw}"
+
+
 @dataclass
 class AccountConfig:
     """The single iLink bot identity this gateway owns (one WeChat, one bot)."""
@@ -114,6 +150,13 @@ class VirtualConfig:
     # the gateway's bot identity).
     reuse_token_env: str = ""
     reuse_token_file: str = ""
+    # The general form of the two knobs above: one entry per agent, e.g.
+    # ``{"workbuddy": "file:data/workbuddy-token.txt"}``. ``join.py`` writes these
+    # when it hands an agent a token *we* minted — the case of a client that can
+    # neither re-point its QR login at us (WorkBuddy's QR path is hard-wired to
+    # Tencent) nor hand over a real token. Without this the legacy slot above
+    # would be the only way in, i.e. exactly one such agent per gateway.
+    accept_tokens: Dict[str, str] = field(default_factory=dict)
     # --- remote (non-local) agents ------------------------------------------
     # A pre-shared key a remote agent must present to get a QR at all. Empty =
     # only the auto_approve list may bind (in practice: the local machine).
@@ -132,20 +175,30 @@ class VirtualConfig:
         return (name or "").lower() in [n.lower() for n in self.auto_approve]
 
     def reuse_tokens(self, own_token: str = "") -> Dict[str, str]:
-        """token -> agent name: which already-issued tokens the virtual server accepts."""
-        if not self.reuse_real_token_for:
-            return {}
-        import os  # local: keeps this module dependency-free at import time
+        """token -> agent name: which already-issued tokens the virtual server accepts.
 
-        token = os.environ.get(self.reuse_token_env, "").strip() if self.reuse_token_env else ""
-        if not token and self.reuse_token_file:
-            try:
-                token = Path(self.reuse_token_file).expanduser().read_text(encoding="utf-8").strip()
-            except OSError:
-                token = ""
-        if not token:
-            token = (own_token or "").strip()
-        return {token: self.reuse_real_token_for} if token else {}
+        Two ways in, merged into one map: ``accept_tokens`` (per-agent sources,
+        what ``join.py`` writes) and the legacy ``reuse_real_token_for`` slot
+        (an agent whose *own* real token must be honoured, with a fallback to the
+        gateway's own binding when neither env nor file gives one).
+        """
+        tokens: Dict[str, str] = {}
+        if self.reuse_real_token_for:
+            token = os.environ.get(self.reuse_token_env, "").strip() if self.reuse_token_env else ""
+            if not token and self.reuse_token_file:
+                try:
+                    token = Path(self.reuse_token_file).expanduser().read_text(encoding="utf-8").strip()
+                except OSError:
+                    token = ""
+            if not token:
+                token = (own_token or "").strip()
+            if token:
+                tokens[token] = self.reuse_real_token_for
+        for name, source in (self.accept_tokens or {}).items():
+            token = read_token_source(source)
+            if token:
+                tokens[token] = name
+        return tokens
 
 
 @dataclass
@@ -260,6 +313,8 @@ def load_config(path: str | os.PathLike[str]) -> Config:
         reuse_real_token_for=str(virtual_raw.get("reuse_real_token_for") or "").lower(),
         reuse_token_env=str(virtual_raw.get("reuse_token_env") or ""),
         reuse_token_file=str(virtual_raw.get("reuse_token_file") or ""),
+        accept_tokens={str(name).lower(): _resolve_token_source(str(source), root)
+                       for name, source in (virtual_raw.get("accept_tokens") or {}).items()},
         bind_key=str(virtual_raw.get("bind_key") or ""),
         public_url=str(virtual_raw.get("public_url") or "").rstrip("/"),
         allow_cidrs=[str(c) for c in (virtual_raw.get("allow_cidrs") or [])],
@@ -268,6 +323,10 @@ def load_config(path: str | os.PathLike[str]) -> Config:
     if virtual.reuse_real_token_for and virtual.reuse_real_token_for not in agents:
         raise ConfigError(
             f"virtual.reuse_real_token_for='{virtual.reuse_real_token_for}' is not a configured agent")
+    for token_agent in virtual.accept_tokens:
+        if token_agent not in agents:
+            raise ConfigError(
+                f"virtual.accept_tokens['{token_agent}'] is not a configured agent")
 
     dashboard_raw = dict(raw.get("dashboard") or {})
     dashboard = DashboardConfig(

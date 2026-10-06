@@ -3,6 +3,10 @@ data/
 account.json
 gateway.json
 *.local.json
+# join.py 改配置前留的备份
+*.bak-join-*
+# WorkBuddy 桌面版自己的配置目录（如果映射进项目目录）
+.workbuddy/
 
 # python
 __pycache__/
