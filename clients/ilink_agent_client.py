@@ -244,9 +244,16 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--png", default="", help="write the QR to this PNG (needs segno)")
     parser.add_argument("--reuse-token", default="",
                         help="a token the agent already holds (see virtual.reuse_real_token_for)")
+    parser.add_argument("--bind-key", default="",
+                        help="pre-shared key a remote gateway requires before it hands out "
+                             "an identity (also via the ILINK_BIND_KEY environment variable)")
     args = parser.parse_args(argv)
 
     creds_path = Path(args.creds) if args.creds else Path("data") / f"virtual-client-{args.name}.json"
+    if args.bind_key:
+        # The QR request is built deep inside ilink.fetch_qr; the env is how the
+        # key travels without threading it through every call.
+        os.environ["ILINK_BIND_KEY"] = args.bind_key
     creds = load_creds(creds_path)
 
     if args.reuse_token:
@@ -315,8 +322,11 @@ def main(argv: list | None = None) -> int:
         for message in response.get("msgs") or []:
             text = ilink.message_text(message)
             sender = ilink.sender_of(message)
+            if text.strip() and not is_local_gateway(getattr(client, "base_url", "")):
+                # 网关在别的机器上：把「下载地址」换成本机真能读到的文件
+                text = materialize_media(text, client, Path("data") / "inbox")
             if not text.strip():
-                log("收到一条没有文本的消息（图片/语音暂时不支持），跳过。")
+                log("收到一条没有内容的消息，跳过。")
                 continue
             log(f"← {sender}: {text[:80]}")
             started = time.time()
@@ -363,21 +373,90 @@ def extract_media_marks(answer: str) -> tuple[str, list[str]]:
     return "\n".join(kept).strip(), paths
 
 
-def send_local_media(client, sender: str, path: str, message: dict) -> None:
-    """Hand a local file to the gateway, which encrypts and uploads it.
+def is_local_gateway(base_url: str) -> bool:
+    """True when the gateway runs on this very machine (paths are then shared)."""
+    import urllib.parse as _urlparse
 
-    The path travels as ``localpath:<abs>``: the gateway runs on this machine, so
-    it reads the file itself. Encryption and the CDN upload stay on the gateway
-    side, where the iLink credentials live.
+    host = (_urlparse.urlsplit(base_url or "").hostname or "").lower()
+    return host in {"127.0.0.1", "localhost", "::1", "0.0.0.0", ""}
+
+
+def upload_blob(client, name: str, data: bytes) -> str:
+    """Push file bytes to the gateway; returns a ``blob:<id>`` reference.
+
+    A remote agent cannot hand over a path — its filesystem is not the gateway's.
+    """
+    import urllib.parse as _urlparse
+    import urllib.request as _urlrequest
+
+    url = f"{str(client.base_url).rstrip('/')}/upload"
+    request = _urlrequest.Request(
+        url, data=data, method="POST",
+        headers={"Authorization": f"Bearer {client.token}",
+                 "X-File-Name": _urlparse.quote(name),
+                 "Content-Type": "application/octet-stream"})
+    with _urlrequest.urlopen(request, timeout=300) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if int(payload.get("ret", -1)) != 0 or not payload.get("blob"):
+        raise RuntimeError(f"网关拒绝了上传：{payload}")
+    return str(payload["blob"])
+
+
+def fetch_remote_media(client, url: str, out_dir: Path) -> Path:
+    """Download one media file the gateway stored (remote agents only)."""
+    import urllib.parse as _urlparse
+    import urllib.request as _urlrequest
+
+    request = _urlrequest.Request(url, headers={"Authorization": f"Bearer {client.token}"})
+    with _urlrequest.urlopen(request, timeout=300) as response:
+        data = response.read()
+        name = _urlparse.unquote(response.headers.get("X-File-Name") or "media.bin")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / Path(name).name
+    target.write_bytes(data)
+    return target
+
+
+def materialize_media(text: str, client, out_dir: Path) -> str:
+    """Turn the gateway's 「下载地址：…」 lines into real local paths.
+
+    The gateway sits on another machine, so the path it printed means nothing
+    here; we fetch the bytes with our own token and hand the agent a usable path.
+    """
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("下载地址："):
+            url = stripped[len("下载地址："):].strip()
+            try:
+                target = fetch_remote_media(client, url, out_dir)
+                lines.append(f"本地路径：{target}")
+                continue
+            except Exception as exc:  # noqa: BLE001 - keep the URL so the agent can try
+                log(f"（取不到远端文件 {url}：{exc}）")
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def send_local_media(client, sender: str, path: str, message: dict) -> None:
+    """Hand a file to the gateway, which encrypts and uploads it.
+
+    Same machine → the gateway reads it itself (``localpath:``). Different machine
+    → we POST the bytes to the gateway's ``/upload`` first (``blob:``), because our
+    path means nothing over there.
     """
     try:
         absolute = os.path.abspath(path)
         if not os.path.isfile(absolute):
             log(f"（{path} 不存在，跳过）")
             return
+        reference = f"localpath:{absolute}"
+        if not is_local_gateway(getattr(client, "base_url", "")):
+            with open(absolute, "rb") as handle:
+                reference = upload_blob(client, os.path.basename(absolute), handle.read())
         item = media.build_media_item(
             media.item_type_for(absolute),
-            encrypt_query_param=f"localpath:{absolute}",
+            encrypt_query_param=reference,
             aes_key=bytes(16), filename=os.path.basename(absolute),
             plaintext_size=os.path.getsize(absolute), ciphertext_size=0)
         ilink_media.send_items(client, sender, [item],

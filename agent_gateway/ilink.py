@@ -148,9 +148,22 @@ def _request(method: str, base_url: str, endpoint: str, *, token: Optional[str] 
 # --------------------------------------------------------------------------
 # QR login (no token needed)
 # --------------------------------------------------------------------------
-def fetch_qr(bot_type: str = "3", base_url: str = BASE_URL) -> Tuple[str, str]:
-    """Return ``(qrcode_value, qrcode_url)`` for the login QR."""
-    data = _request("GET", base_url, f"{EP_GET_BOT_QR}?bot_type={urllib.parse.quote(bot_type)}",
+def fetch_qr(bot_type: str = "3", base_url: str = BASE_URL,
+             bind_key: str = "") -> Tuple[str, str]:
+    """Return ``(qrcode_value, qrcode_url)`` for the login QR.
+
+    ``bind_key`` goes through as a query parameter: a *virtual* gateway reachable
+    from other machines requires the pre-shared key before it hands out an
+    identity (a real iLink server just ignores the extra parameter). Falls back to
+    ``ILINK_BIND_KEY`` in the environment so a client can set it once.
+    """
+    import os
+    # QR login itself sets no token; the shared key is the only credential here.
+    bind_key = bind_key or os.environ.get("ILINK_BIND_KEY", "")
+    endpoint = f"{EP_GET_BOT_QR}?bot_type={urllib.parse.quote(bot_type)}"
+    if bind_key:
+        endpoint += f"&key={urllib.parse.quote(bind_key)}"
+    data = _request("GET", base_url, endpoint,
                     timeout_ms=QR_TIMEOUT_MS,
                     extra_headers={"iLink-App-Id": ILINK_APP_ID,
                                    "iLink-App-ClientVersion": str(ILINK_APP_CLIENT_VERSION)})

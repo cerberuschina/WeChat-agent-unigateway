@@ -111,6 +111,15 @@ class VirtualConfig:
     # the gateway's bot identity).
     reuse_token_env: str = ""
     reuse_token_file: str = ""
+    # --- remote (non-local) agents ------------------------------------------
+    # A pre-shared key a remote agent must present to get a QR at all. Empty =
+    # only the auto_approve list may bind (in practice: the local machine).
+    bind_key: str = ""
+    # Where remote agents can reach this gateway (e.g. http://192.168.1.5:18500).
+    # Used for the media download links handed to agents. No TLS here on purpose:
+    # for anything beyond a trusted LAN, put an SSH tunnel or a reverse proxy with
+    # a real certificate in front (see docs/REMOTE-AGENTS.md).
+    public_url: str = ""
 
     def approves(self, name: str) -> bool:
         return (name or "").lower() in [n.lower() for n in self.auto_approve]
@@ -229,6 +238,8 @@ def load_config(path: str | os.PathLike[str]) -> Config:
         reuse_real_token_for=str(virtual_raw.get("reuse_real_token_for") or "").lower(),
         reuse_token_env=str(virtual_raw.get("reuse_token_env") or ""),
         reuse_token_file=str(virtual_raw.get("reuse_token_file") or ""),
+        bind_key=str(virtual_raw.get("bind_key") or ""),
+        public_url=str(virtual_raw.get("public_url") or "").rstrip("/"),
     )
     if virtual.reuse_real_token_for and virtual.reuse_real_token_for not in agents:
         raise ConfigError(

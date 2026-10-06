@@ -366,5 +366,101 @@ class ReuseWiringTests(unittest.TestCase):
             self.assertIn("reuse_real_token_for", str(ctx.exception))
 
 
+class RemoteAgentTests(unittest.TestCase):
+    """非本机 agent：预共享密钥取码 + 上传/下载媒体（不共享文件系统）。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.server = VirtualILinkServer(data_dir=self.tmp / "data" / "virtual", port=0,
+                                         bind_key="s3cret",
+                                         public_url="http://10.0.0.5:18500")
+        self.host, self.port = self.server.start()
+        self.base = f"http://{self.host}:{self.port}"
+        qr = get(f"{self.base}/ilink/bot/get_bot_qrcode?key=s3cret")
+        post(f"{self.base}/admin/approve", {"qrcode": qr["qrcode"], "name": "claude"})
+        self.token = get(f"{self.base}/ilink/bot/get_qrcode_status?qrcode={qr['qrcode']}")["bot_token"]
+
+    def tearDown(self):
+        self.server.stop()
+        self._tmp.cleanup()
+
+    @staticmethod
+    def post_raw(url, data, token="", filename=""):
+        headers = {"Content-Type": "application/octet-stream"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        if filename:
+            headers["X-File-Name"] = urllib.parse.quote(filename)
+        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:      # 401 是预期答案之一
+            body = exc.read().decode("utf-8", "replace")
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError:
+                return {"ret": -1, "http": exc.code, "body": body}
+
+    @staticmethod
+    def get_bytes(url, token=""):
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
+    def test_qr_without_the_bind_key_is_refused(self):
+        result = get(f"{self.base}/ilink/bot/get_bot_qrcode")
+        self.assertNotEqual(result["ret"], 0, "没有密钥就不该发码")
+        self.assertIn("bind_key", str(result.get("errmsg", "")))
+
+    def test_public_base_prefers_public_url(self):
+        self.assertEqual(self.server.public_base(), "http://10.0.0.5:18500")
+        self.assertTrue(self.server.media_url("peer", "a.pdf").startswith("http://10.0.0.5:18500/media/"))
+
+    def test_a_remote_agent_can_push_bytes_and_get_a_blob(self):
+        data = "远端文件内容".encode() * 3
+        payload = self.post_raw(f"{self.base}/upload", data, token=self.token, filename="报表.pdf")
+        self.assertEqual(payload["ret"], 0)
+        self.assertTrue(payload["blob"].startswith("blob:"))
+        self.assertEqual(payload["size"], len(data))
+        path = self.server.blob_path(payload["blob"])
+        self.assertIsNotNone(path)
+        self.assertEqual(path.read_bytes(), data)
+        self.assertTrue(path.name.endswith("报表.pdf"))
+
+    def test_upload_requires_a_valid_token(self):
+        self.assertNotEqual(self.post_raw(f"{self.base}/upload", b"x")["ret"], 0)
+        self.assertNotEqual(self.post_raw(f"{self.base}/upload", b"x", token="bogus")["ret"], 0)
+
+    def test_an_empty_upload_is_refused(self):
+        self.assertNotEqual(self.post_raw(f"{self.base}/upload", b"", token=self.token)["ret"], 0)
+
+    def test_an_unknown_blob_is_not_resolved(self):
+        self.assertIsNone(self.server.blob_path("blob:deadbeef"))
+
+    def test_media_download_serves_a_stored_file_to_the_owner(self):
+        folder = self.tmp / "data" / "media" / "peer"
+        folder.mkdir(parents=True)
+        (folder / "a.pdf").write_bytes(b"stored-bytes")
+        status, body = self.get_bytes(f"{self.base}/media/peer/a.pdf", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"stored-bytes")
+
+    def test_media_download_requires_a_token(self):
+        status, _body = self.get_bytes(f"{self.base}/media/peer/a.pdf")
+        self.assertEqual(status, 401)
+
+    def test_media_download_refuses_to_escape_the_media_root(self):
+        outside = self.tmp / "secret.txt"
+        outside.write_bytes(b"nope")
+        self.assertIsNone(self.server.read_media("../secret.txt"))
+        self.assertIsNone(self.server.read_media("peer/../../secret.txt"))
+
+
 if __name__ == "__main__":
     unittest.main()

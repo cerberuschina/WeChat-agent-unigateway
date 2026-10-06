@@ -150,6 +150,7 @@ class VirtualILinkServer:
                  on_outbound: Optional[Callable[[VirtualBind, str], None]] = None,
                  on_outbound_items: Optional[Callable[[VirtualBind, List[Dict[str, Any]]], None]] = None,
                  on_typing: Optional[Callable[[VirtualBind, int], None]] = None,
+                 bind_key: str = "", public_url: str = "",
                  on_log: Optional[Callable[[str], None]] = None):
         self.host = host
         self.port = port
@@ -165,6 +166,12 @@ class VirtualILinkServer:
         # Heartbeats from an agent ("still working") — the gateway holds the real
         # typing indicator; nothing is sent to WeChat for these.
         self.on_typing = on_typing
+        # Remote agents: a pre-shared bind key, and the address they should use to
+        # fetch media they cannot read from this machine's disk.
+        self.bind_key = bind_key or ""
+        self.public_url = (public_url or "").rstrip("/")
+        self.uploads: Dict[str, Dict[str, Any]] = {}
+        self.upload_dir = self.dir / "uploads"
         self._log = on_log or (lambda _m: None)
         self._lock = threading.RLock()
         self._binds: Dict[str, VirtualBind] = {}   # qrcode -> bind
@@ -302,6 +309,61 @@ class VirtualILinkServer:
         return f"http://{self.host}:{self.port}"
 
     # -- endpoint bodies (also directly unit-testable) -------------------
+    # -- remote (non-local) agents ---------------------------------------
+    def public_base(self) -> str:
+        """The address agents should use to reach us (``public_url`` wins)."""
+        return self.public_url or self.base_url()
+
+    def check_bind_key(self, key: str) -> bool:
+        """A remote agent must know the pre-shared key.
+
+        With no key configured the QR endpoint stays effectively local-only: only
+        names in ``auto_approve`` get identities without an operator clicking
+        approve.
+        """
+        if not self.bind_key:
+            return True
+        return secrets.compare_digest(str(key or ""), self.bind_key)
+
+    def save_blob(self, name: str, data: bytes) -> str:
+        """Keep bytes uploaded by a remote agent and return an opaque blob id."""
+        blob_id = secrets.token_hex(8)
+        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        safe = Path(name or "file.bin").name or "file.bin"
+        target = self.upload_dir / f"{blob_id}-{safe}"
+        target.write_bytes(data)
+        self.uploads[blob_id] = {"name": safe, "size": len(data), "path": target}
+        self._log(f"remote: stored {safe} ({len(data)} bytes) as blob {blob_id}")
+        return blob_id
+
+    def blob_path(self, reference: str) -> Optional[Path]:
+        """Resolve ``blob:<id>`` (or a bare id) to the file we stored."""
+        blob_id = reference.split(":", 1)[1] if reference.startswith("blob:") else reference
+        entry = self.uploads.get(blob_id) or {}
+        path = entry.get("path")
+        return Path(path) if path and Path(path).is_file() else None
+
+    def media_url(self, folder: str, name: str) -> str:
+        """Where an agent that is *not* on this machine fetches a stored file."""
+        return (f"{self.public_base()}/media/"
+                f"{urllib.parse.quote(folder, safe='')}/{urllib.parse.quote(name, safe='')}")
+
+    def read_media(self, rest: str) -> Optional[Tuple[str, bytes]]:
+        """Serve one stored inbound file to an authenticated agent.
+
+        ``rest`` is ``<peer-folder>/<filename>`` as handed out by :meth:`media_url`;
+        anything that escapes the media root is refused rather than served.
+        """
+        root = (self.dir.parent / "media").resolve()
+        try:
+            target = (root / urllib.parse.unquote(rest)).resolve()
+        except (OSError, ValueError):
+            return None
+        if root not in target.parents or not target.is_file():
+            self._log(f"remote: refused media request {rest!r}")
+            return None
+        return target.name, target.read_bytes()
+
     def pending_qr(self) -> VirtualBind:
         """Pick which qrcode an agent gets.
 
@@ -320,7 +382,11 @@ class VirtualILinkServer:
         bind.qr_issued = True
         return bind
 
-    def ep_qrcode(self) -> Dict[str, Any]:
+    def ep_qrcode(self, key: str = "") -> Dict[str, Any]:
+        if not self.check_bind_key(key):
+            self._log("virtual: refused a QR request without the bind key")
+            return {"ret": ERR_BAD_REQUEST,
+                    "errmsg": "远程接入需要 bind_key：请在取码请求里带上 ?key=…"}
         bind = self.pending_qr()
         return {"ret": RET_OK, "qrcode": bind.qrcode,
                 "qrcode_img_content": f"{self.base_url()}/bind/{bind.qrcode}"}
@@ -411,10 +477,29 @@ def _make_handler(server: VirtualILinkServer):
             params = dict(urllib.parse.parse_qsl(query))
 
             if path == "/ilink/bot/get_bot_qrcode":
-                self._send(server.ep_qrcode())
+                key = params.get("key") or self.headers.get("X-Bind-Key") or ""
+                self._send(server.ep_qrcode(key))
                 return
             if path == "/ilink/bot/get_qrcode_status":
                 self._send(server.ep_qrcode_status(params.get("qrcode", "")))
+                return
+            if path.startswith("/media/"):
+                # 远程 agent 在这里取回网关替他落盘的附件（用虚拟身份 token 认证）
+                if not server._bind_for_token(self._token()):
+                    self._send({"ret": ERR_SESSION_EXPIRED, "errmsg": "需要虚拟身份的 token"},
+                               status=401)
+                    return
+                served = server.read_media(path[len("/media/"):])
+                if not served:
+                    self._send({"ok": False, "error": "Not Found"}, status=404)
+                    return
+                name, body = served
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("X-File-Name", urllib.parse.quote(name))
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             if path == "/admin/binds":
                 self._send({"ok": True, "binds": server.binds()})
@@ -439,6 +524,24 @@ def _make_handler(server: VirtualILinkServer):
         def do_POST(self) -> None:  # noqa: N802
             path, _, query = self.path.partition("?")
             params = dict(urllib.parse.parse_qsl(query))
+
+            if path == "/upload":
+                # 远程 agent 把文件字节推过来（它的路径在这边没有意义）
+                if not server._bind_for_token(self._token()):
+                    self._send({"ret": ERR_SESSION_EXPIRED, "errmsg": "需要虚拟身份的 token"},
+                               status=401)
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                data = self.rfile.read(length) if length else b""
+                if not data:
+                    self._send({"ret": ERR_BAD_REQUEST, "errmsg": "文件内容为空"})
+                    return
+                name = urllib.parse.unquote(self.headers.get("X-File-Name") or "file.bin")
+                blob = server.save_blob(name, data)
+                self._send({"ret": RET_OK, "blob": f"blob:{blob}",
+                            "name": Path(name).name, "size": len(data)})
+                return
+
             payload = self._json_body()
 
             if path == "/ilink/bot/get_bot_qrcode":

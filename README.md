@@ -161,7 +161,7 @@ python -m agent_gateway --config gateway.json
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -t .     # 173 项，全部离线（不联网、不碰微信）
+python -m unittest discover -s tests -t .     # 192 项，全部离线（不联网、不碰微信）
 ```
 
 测试覆盖：路由语法（含命令与 agent 前缀冲突）、A2A 回复提取、exec 后端（argv/stdin/超时/非零退出）、
@@ -185,10 +185,11 @@ clients/ilink_agent_client.py   把任意 agent 挂到微信上的客户端（�
 examples/virtual_loop_demo.py   一条命令跑完"虚拟 iLink"全流程（真客户端，不联网）
 bridges/           可选桥：bridges/electron_cdp.py 用 CDP 驱动只有桌面版的 agent
 docs/VIRTUAL-ILINK.md       虚拟 iLink 的设计、接法、批准流程、边界
+docs/REMOTE-AGENTS.md       非本机 agent 接入：bind_key、上传/下载、安全边界
 docs/PROTOCOL.md            iLink 协议实测要点
 docs/BACKENDS-WORKBUDDY.md  WorkBuddy 实测结论 + 两条接法
 docs/SWITCH.md              把微信切到网关的步骤（含回滚）
-tests/             173 项离线测试
+tests/             192 项离线测试
 ```
 
 ## 已知限制 / Roadmap

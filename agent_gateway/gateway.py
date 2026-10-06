@@ -255,7 +255,13 @@ class Gateway:
                 continue
             size = target.stat().st_size
             log.info("media from %s -> %s (%d bytes)", _safe(sender), target, size)
-            parts.append(f"[{label}] {target.name}（{size} 字节）\n本地路径：{target}")
+            lines = [f"[{label}] {target.name}（{size} 字节）",
+                     f"本地路径（网关所在机器）：{target}"]
+            if self.virtual:
+                # A remote agent cannot read that path; give it a way to fetch the file.
+                lines.append(f"下载地址：{self.virtual.media_url(folder, target.name)}"
+                             f"（带你的 token 作 Bearer 认证）")
+            parts.append("\n".join(lines))
         return "\n\n".join(parts).strip()
 
     def handle(self, message: dict) -> None:
@@ -404,6 +410,8 @@ class Gateway:
             on_outbound=self._forward_to_wechat,
             on_outbound_items=self._forward_media_to_wechat,
             on_typing=self._agent_typing,
+            bind_key=self.cfg.virtual.bind_key,
+            public_url=self.cfg.virtual.public_url,
             on_log=log.info,
         )
         host, port = self.virtual.start()
@@ -469,11 +477,19 @@ class Gateway:
             if not info:
                 continue
             source = info["encrypt_query_param"]
-            if not source.startswith("localpath:"):
+            if source.startswith("localpath:"):
+                path = Path(source[len("localpath:"):])
+            elif source.startswith("blob:"):
+                # A remote agent uploaded the bytes to us; keep the accounting honest.
+                path = self.virtual.blob_path(source) if self.virtual else None
+                if path is None:
+                    log.warning("virtual: %s sent blob %s the gateway no longer has",
+                                bind.name, source[:24])
+                    continue
+            else:
                 log.warning("virtual: %s sent media this gateway cannot read (%s)",
                             bind.name, source[:48])
                 continue
-            path = Path(source[len("localpath:"):])
             if not path.is_file():
                 log.warning("virtual: %s pointed at a missing file %s", bind.name, path)
                 continue

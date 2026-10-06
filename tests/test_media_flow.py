@@ -86,7 +86,8 @@ class InboundMediaTests(unittest.TestCase):
         text = messages[0]["item_list"][0]["text_item"]["text"]
         self.assertIn("[文件]", text)
         self.assertIn("报表.pdf", text)
-        self.assertIn("本地路径：", text)
+        self.assertIn("本地路径", text)
+        self.assertIn("下载地址", text, "远程 agent 要有办法取到这个文件")
         self.assertTrue(self.saved, "应当调用下载")
         self.assertIn(str(self.saved[0][2]), text)
 

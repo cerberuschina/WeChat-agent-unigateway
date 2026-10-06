@@ -7,6 +7,7 @@ covered by test_virtual_ilink.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
@@ -120,6 +121,144 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(parts[0], "C:/Python314/python.exe")
         self.assertEqual(parts[1], "C:/tools/cc_runner.py")
         self.assertEqual(parts[2], "{text}")
+
+
+class RemoteClientTests(unittest.TestCase):
+    """客户端在"网关不在本机"时的两件事：推文件、取文件。"""
+
+    def test_gateway_locality_detection(self):
+        for url in ("http://127.0.0.1:18500", "http://localhost:1", "http://0.0.0.0:2", ""):
+            self.assertTrue(client.is_local_gateway(url), url)
+        for url in ("http://192.168.1.5:18500", "http://gw.lan:18500", "https://gw.example"):
+            self.assertFalse(client.is_local_gateway(url), url)
+
+    def test_upload_blob_posts_the_bytes_with_our_token(self):
+        import urllib.request as urlrequest
+
+        captured = {}
+
+        class FakeResponse:
+            def read(self):
+                return b'{"ret": 0, "blob": "blob:abc", "name": "a b.bin", "size": 3}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        def fake_urlopen(request, timeout=0):
+            captured["url"] = request.full_url
+            captured["headers"] = {k.lower(): v for k, v in request.headers.items()}
+            captured["data"] = request.data
+            return FakeResponse()
+
+        real = urlrequest.urlopen
+        urlrequest.urlopen = fake_urlopen
+        try:
+            gateway = type("C", (), {"base_url": "http://gw:18500", "token": "tok"})()
+            blob = client.upload_blob(gateway, "a b.bin", b"xyz")
+        finally:
+            urlrequest.urlopen = real
+
+        self.assertEqual(blob, "blob:abc")
+        self.assertEqual(captured["url"], "http://gw:18500/upload")
+        self.assertEqual(captured["data"], b"xyz")
+        self.assertEqual(captured["headers"]["authorization"], "Bearer tok")
+        self.assertEqual(captured["headers"]["x-file-name"], "a%20b.bin")
+
+    def test_materialize_replaces_the_download_url_with_a_real_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def fake_fetch(_client, _url, out_dir):
+                target = Path(out_dir) / "got.pdf"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"x")
+                return target
+
+            real = client.fetch_remote_media
+            client.fetch_remote_media = fake_fetch
+            try:
+                text = client.materialize_media(
+                    "[文件] a.pdf（1 字节）\n本地路径（网关所在机器）：K:/gw/a.pdf\n"
+                    "下载地址：http://gw/media/peer/a.pdf（带你的 token 作 Bearer 认证）",
+                    None, Path(tmp))
+            finally:
+                client.fetch_remote_media = real
+
+        self.assertIn("本地路径：", text)
+        self.assertNotIn("下载地址：", text)
+        self.assertIn("got.pdf", text)
+
+    def test_materialize_keeps_the_url_when_the_fetch_fails(self):
+        def boom(*_a, **_k):
+            raise OSError("网络不通")
+
+        real = client.fetch_remote_media
+        client.fetch_remote_media = boom
+        try:
+            text = client.materialize_media("下载地址：http://gw/x", None, Path("."))
+        finally:
+            client.fetch_remote_media = real
+        self.assertIn("下载地址：http://gw/x", text, "取不到时把原文留着，而不是静默丢掉")
+
+
+class BindKeyTests(unittest.TestCase):
+    """远程接入：取码时必须带上预共享密钥（否则网关不给身份）。"""
+
+    def test_fetch_qr_sends_the_key_as_a_query_parameter(self):
+        seen = {}
+
+        def fake_request(method, base_url, endpoint, **kwargs):
+            seen["endpoint"] = endpoint
+            return {"qrcode": "q1", "qrcode_img_content": "http://gw/bind/q1"}
+
+        real = client.ilink._request
+        client.ilink._request = fake_request
+        try:
+            value, url = client.ilink.fetch_qr(base_url="http://gw:1", bind_key="s3cret")
+        finally:
+            client.ilink._request = real
+
+        self.assertEqual(value, "q1")
+        self.assertIn("key=s3cret", seen["endpoint"])
+        self.assertIn("bot_type=3", seen["endpoint"])
+
+    def test_the_key_can_come_from_the_environment(self):
+        seen = {}
+
+        def fake_request(method, base_url, endpoint, **kwargs):
+            seen["endpoint"] = endpoint
+            return {"qrcode": "q1", "qrcode_img_content": ""}
+
+        real, real_env = client.ilink._request, os.environ.get("ILINK_BIND_KEY")
+        client.ilink._request = fake_request
+        os.environ["ILINK_BIND_KEY"] = "from-env"
+        try:
+            client.ilink.fetch_qr(base_url="http://gw:1")
+        finally:
+            client.ilink._request = real
+            if real_env is None:
+                os.environ.pop("ILINK_BIND_KEY", None)
+            else:
+                os.environ["ILINK_BIND_KEY"] = real_env
+        self.assertIn("key=from-env", seen["endpoint"])
+
+    def test_no_key_means_no_extra_parameter(self):
+        seen = {}
+
+        def fake_request(method, base_url, endpoint, **kwargs):
+            seen["endpoint"] = endpoint
+            return {"qrcode": "q1", "qrcode_img_content": ""}
+
+        real, real_env = client.ilink._request, os.environ.pop("ILINK_BIND_KEY", None)
+        client.ilink._request = fake_request
+        try:
+            client.ilink.fetch_qr(base_url="http://gw:1")
+        finally:
+            client.ilink._request = real
+            if real_env is not None:
+                os.environ["ILINK_BIND_KEY"] = real_env
+        self.assertNotIn("key=", seen["endpoint"])
 
 
 if __name__ == "__main__":
