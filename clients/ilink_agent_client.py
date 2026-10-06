@@ -141,6 +141,11 @@ def run_with_progress(runner: list[str], text: str, args, session: str, sender: 
     notes = getattr(args, "progress_notes", False)
     delay = hb
     beating = False
+    # 立刻打第一拍：微信的「正在输入」自己有寿命，等满一个周期再发的话，
+    # 每轮开头那几十秒看起来跟死了没区别。心跳是零微信开销的，早点发不亏。
+    if hb and not notes:
+        heartbeat(client, sender, message, ilink.TYPING_START)
+        beating = True
     while worker.is_alive():
         worker.join(timeout=delay or 5.0)
         if not worker.is_alive():
