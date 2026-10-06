@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Optional
 
-from . import backends, ilink, markdown, router
+from . import backends, ilink, ilink_media, markdown, media, router
 from .config import Config, ConfigError, load_account, load_config, save_account
 from .store import StateStore
 from .virtual_ilink import VirtualILinkServer
@@ -209,12 +209,49 @@ class Gateway:
             self._typing(chat_id, ilink.TYPING_STOP)
 
     # -- message handling ------------------------------------------------
+    def _ingest_media(self, message: dict, sender: str) -> str:
+        """Download inbound media, keep it locally, describe it for the agent.
+
+        The agent receives plain text with the local path, so *every* kind of
+        backend can use the attachment without speaking iLink media itself.
+        """
+        parts: list[str] = []
+        folder = "".join(ch if ch.isalnum() or ch in "-._" else "_" for ch in sender)[:48] or "peer"
+        labels = {media.ITEM_IMAGE: "图片", media.ITEM_FILE: "文件",
+                  media.ITEM_VIDEO: "视频", media.ITEM_VOICE: "语音"}
+        for item in message.get("item_list") or []:
+            info = media.parse_media_item(item)
+            if not info:
+                continue
+            label = labels.get(info["item_type"], "媒体")
+            name = info["filename"] or f"{label}-{int(time.time())}"
+            if self.dry_run:
+                parts.append(f"[{label}] {name}（dry-run：没有下载）")
+                continue
+            if self.client is None:
+                parts.append(f"[{label}] {name}（网关还没绑定微信，下载不了）")
+                continue
+            try:
+                target = ilink_media.download_media(self.client, info,
+                                                    Path(self.cfg.data_dir) / "media" / folder,
+                                                    name=name)
+            except Exception as exc:  # noqa: BLE001 - a bad attachment must not kill the turn
+                log.warning("media download failed from %s: %s", _safe(sender), exc)
+                parts.append(f"[{label}] {name} 下载失败：{exc}")
+                continue
+            size = target.stat().st_size
+            log.info("media from %s -> %s (%d bytes)", _safe(sender), target, size)
+            parts.append(f"[{label}] {target.name}（{size} 字节）\n本地路径：{target}")
+        return "\n\n".join(parts).strip()
+
     def handle(self, message: dict) -> None:
         sender = ilink.sender_of(message)
         if not sender or (self.client and sender == self.client.account_id):
             return
         message_id = str(message.get("message_id") or "").strip()
         text = ilink.message_text(message)
+        if not text:
+            text = self._ingest_media(message, sender)   # 图片/文件：落盘后把路径交给 agent
         if message_id and self.store.is_duplicate(f"id:{message_id}"):
             log.debug("duplicate message_id %s", _safe(message_id))
             return
@@ -229,7 +266,7 @@ class Gateway:
             self._send(sender, pending)
         if not text:
             if not self.dry_run:
-                self._send(sender, "现在只认文字消息（图片/语音还没接）。")
+                self._send(sender, "这条消息里没有我能读的内容（文字、图片、文件都行）。")
             return
         if not self.cfg.access.allows(sender):
             log.info("ignored message from unauthorized %s", _safe(sender))
@@ -351,6 +388,7 @@ class Gateway:
             auto_approve=self.cfg.virtual.auto_approve,
             accept_tokens=self.cfg.virtual.reuse_tokens(self.cfg.account.token),
             on_outbound=self._forward_to_wechat,
+            on_outbound_items=self._forward_media_to_wechat,
             on_log=log.info,
         )
         host, port = self.virtual.start()
@@ -375,6 +413,57 @@ class Gateway:
         self._stop_typing(peer)
         log.info("virtual: %s -> wechat %s (%d chars)", bind.name, _safe(peer), len(text))
         self._send(peer, text)
+
+    def _budget_left(self, chat_id: str) -> int:
+        return max(0, max(1, int(self.cfg.delivery.max_messages_per_turn))
+                   - self._turn_counts.get(chat_id, 0))
+
+    def _send_media_path(self, chat_id: str, path: Path) -> None:
+        """Upload one local file to WeChat's CDN and send it as an attachment."""
+        if self.dry_run or self.client is None:
+            log.info("[dry-run] 附件 -> %s: %s", _safe(chat_id), path)
+            print(f"[dry-run] 附件 -> {_safe(chat_id)}: {path}")
+            return
+        if self._budget_left(chat_id) <= 0:
+            # No new state on purpose: the file is still on disk, and the note tells
+            # the peer why nothing arrived.
+            self._queue_pending(chat_id, f"（这一轮消息额度用完了，附件 {path.name} 没发出去）")
+            log.warning("no message budget left for %s; attachment %s not sent", _safe(chat_id), path)
+            return
+        try:
+            ilink_media.send_file(self.client, chat_id, path,
+                                  context_token=self.client.context_token(chat_id))
+            self._turn_counts[chat_id] = self._turn_counts.get(chat_id, 0) + 1
+            log.info("attachment -> %s: %s (%d bytes)", _safe(chat_id), path.name, path.stat().st_size)
+        except ilink.ILinkError as exc:
+            log.error("attachment to %s failed: %s", _safe(chat_id), exc)
+
+    def _forward_media_to_wechat(self, bind, items: list) -> None:
+        """A virtual agent wants to send files: the gateway does the real upload.
+
+        The agent marks a local file as ``localpath:<abs>``; the bytes leave this
+        machine only encrypted, on their way to WeChat's CDN.
+        """
+        peer = bind.last_peer
+        if not peer:
+            log.warning("virtual agent %s sent media before any peer was known", bind.name)
+            return
+        self._stop_typing(peer)
+        for item in items:
+            info = media.parse_media_item(item)
+            if not info:
+                continue
+            source = info["encrypt_query_param"]
+            if not source.startswith("localpath:"):
+                log.warning("virtual: %s sent media this gateway cannot read (%s)",
+                            bind.name, source[:48])
+                continue
+            path = Path(source[len("localpath:"):])
+            if not path.is_file():
+                log.warning("virtual: %s pointed at a missing file %s", bind.name, path)
+                continue
+            log.info("virtual: %s -> wechat %s attachment %s", bind.name, _safe(peer), path.name)
+            self._send_media_path(peer, path)
 
     def _safe_handle(self, message: dict) -> None:
         try:

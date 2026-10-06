@@ -126,10 +126,37 @@ class MessageFlowTests(unittest.TestCase):
         self.assertEqual(result["ret"], 0)
         self.assertEqual(self.sent, [("claude", "回答")])
 
-    def test_empty_or_media_only_send_is_rejected_not_swallowed(self):
+    def test_an_empty_send_is_rejected_not_swallowed(self):
+        result = self.server.ep_sendmessage(self.bind, {"msg": {"item_list": []}})
+        self.assertNotEqual(result["ret"], 0, "空消息要明确报错，而不是静默丢掉")
+
+    def test_media_items_go_to_the_items_callback(self):
+        from agent_gateway import media as media_mod
+
+        got = []
+        self.server.on_outbound_items = lambda bind, items: got.append((bind.name, items))
+        item = media_mod.build_media_item(media_mod.ITEM_FILE, encrypt_query_param="localpath:C:/x/a.pdf",
+                                          aes_key=bytes(16), filename="a.pdf",
+                                          plaintext_size=10, ciphertext_size=16)
+        result = self.server.ep_sendmessage(self.bind, {"msg": {"item_list": [item]}})
+        self.assertEqual(result["ret"], 0)
+        self.assertEqual(got[0][0], "claude")
+        self.assertEqual(got[0][1][0]["file_item"]["file_name"], "a.pdf")
+
+    def test_a_text_and_a_file_in_one_message_reach_both_callbacks(self):
+        from agent_gateway import media as media_mod
+
+        texts, files = [], []
+        self.server.on_outbound_items = lambda bind, items: files.append(items)
+        item = media_mod.build_media_item(media_mod.ITEM_IMAGE, encrypt_query_param="localpath:C:/x/a.png",
+                                          aes_key=bytes(16), filename="a.png",
+                                          plaintext_size=10, ciphertext_size=16)
         result = self.server.ep_sendmessage(self.bind, {"msg": {"item_list": [
-            {"type": 2, "image_item": {}}]}})
-        self.assertNotEqual(result["ret"], 0, "媒体还不支持，要明确报错而不是静默丢掉")
+            {"type": 1, "text_item": {"text": "看这个图"}}, item]}})
+        self.assertEqual(result["ret"], 0)
+        self.assertEqual(self.sent, [("claude", "看这个图")])
+        self.assertEqual(files[0][0]["image_item"]["media"]["encrypt_query_param"],
+                         "localpath:C:/x/a.png")
 
 
 class HttpSurfaceTests(unittest.TestCase):

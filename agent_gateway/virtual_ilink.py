@@ -42,6 +42,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import media
+
 RET_OK = 0
 ERR_SESSION_EXPIRED = -14
 ERR_RATE_LIMIT = -2
@@ -146,6 +148,7 @@ class VirtualILinkServer:
                  auto_approve: Optional[List[str]] = None,
                  accept_tokens: Optional[Dict[str, str]] = None,
                  on_outbound: Optional[Callable[[VirtualBind, str], None]] = None,
+                 on_outbound_items: Optional[Callable[[VirtualBind, List[Dict[str, Any]]], None]] = None,
                  on_log: Optional[Callable[[str], None]] = None):
         self.host = host
         self.port = port
@@ -155,6 +158,9 @@ class VirtualILinkServer:
         # real token -> agent name (see config.VirtualConfig.reuse_real_token_for)
         self.accept_tokens = {t: n for t, n in (accept_tokens or {}).items() if t and n}
         self.on_outbound = on_outbound
+        # Media a virtual agent wants delivered: the gateway turns these into real
+        # iLink items (upload + encrypt) on its own way out.
+        self.on_outbound_items = on_outbound_items
         self._log = on_log or (lambda _m: None)
         self._lock = threading.RLock()
         self._binds: Dict[str, VirtualBind] = {}   # qrcode -> bind
@@ -335,13 +341,25 @@ class VirtualILinkServer:
     def ep_sendmessage(self, bind: VirtualBind, payload: Dict[str, Any]) -> Dict[str, Any]:
         msg = payload.get("msg") or {}
         text = ""
+        media_items: List[Dict[str, Any]] = []
         for item in msg.get("item_list") or []:
-            if isinstance(item, dict) and item.get("type") == 1:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == 1:
                 text += str((item.get("text_item") or {}).get("text") or "")
-        if not text.strip():
-            return {"ret": ERR_BAD_REQUEST, "errmsg": "empty text (media not supported yet)"}
-        if self.on_outbound:
+            elif media.parse_media_item(item):
+                media_items.append(item)
+
+        handled = False
+        if text.strip() and self.on_outbound:
             self.on_outbound(bind, text)
+            handled = True
+        if media_items and self.on_outbound_items:
+            self.on_outbound_items(bind, media_items)
+            handled = True
+        if not handled:
+            return {"ret": ERR_BAD_REQUEST,
+                    "errmsg": "empty message: no text and no usable media item"}
         return {"ret": RET_OK, "msg_id": f"vout-{secrets.token_hex(6)}"}
 
 

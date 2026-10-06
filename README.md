@@ -161,7 +161,7 @@ python -m agent_gateway --config gateway.json
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -t .     # 136 项，全部离线（不联网、不碰微信）
+python -m unittest discover -s tests -t .     # 173 项，全部离线（不联网、不碰微信）
 ```
 
 测试覆盖：路由语法（含命令与 agent 前缀冲突）、A2A 回复提取、exec 后端（argv/stdin/超时/非零退出）、
@@ -188,12 +188,13 @@ docs/VIRTUAL-ILINK.md       虚拟 iLink 的设计、接法、批准流程、边
 docs/PROTOCOL.md            iLink 协议实测要点
 docs/BACKENDS-WORKBUDDY.md  WorkBuddy 实测结论 + 两条接法
 docs/SWITCH.md              把微信切到网关的步骤（含回滚）
-tests/             136 项离线测试
+tests/             173 项离线测试
 ```
 
 ## 已知限制 / Roadmap
 
-- [ ] 图片 / 语音 / 文件（iLink 有 media 链路：`getuploadurl` + CDN 加密下载，还没接）
+- [x] 图片 / 文件 双向（`getuploadurl` + AES-128-ECB + CDN；自带纯 Python AES，靠 NIST 向量保证正确性）
+- [ ] 语音 / 视频：协议分支已写，未实测
 - [ ] 群聊（取决于 iLink 是否给这个身份下发群事件）
 - [ ] 一条消息并发问多个 agent（`/all`）与结果汇总
 - [ ] WorkBuddy 之类的桌面应用适配（只有本地 API / 无 CLI 的场景）

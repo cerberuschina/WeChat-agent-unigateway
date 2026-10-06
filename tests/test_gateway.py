@@ -108,7 +108,8 @@ class DryRunTests(unittest.TestCase):
         finally:
             gateway.shutdown()
 
-    def test_non_text_message_gets_a_polite_reply(self):
+    def test_an_image_message_reaches_the_agent_as_text(self):
+        """媒体不再是"只认文字"的拒绝——它变成一条带路径的文本消息交给 agent。"""
         gateway = Gateway(self.cfg, dry_run=False)
         gateway.client = None  # dry-run flag off, but no iLink client: _send logs only
         try:
@@ -116,7 +117,21 @@ class DryRunTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 gateway.handle({"from_user_id": "u1", "message_id": "m-img",
                                 "item_list": [{"type": 2, "image_item": {}}]})
-            self.assertIn("只认文字", buffer.getvalue())
+            output = buffer.getvalue()
+            self.assertIn("[图片]", output)
+            self.assertIn("下载不了", output, "没有客户端时要说清楚，而不是假装下载过")
+        finally:
+            gateway.shutdown()
+
+    def test_a_message_with_nothing_readable_gets_a_polite_reply(self):
+        gateway = Gateway(self.cfg, dry_run=False)
+        gateway.client = None
+        try:
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                gateway.handle({"from_user_id": "u1", "message_id": "m-empty",
+                                "item_list": [{"type": 9, "unknown_item": {}}]})
+            self.assertIn("没有我能读的内容", buffer.getvalue())
         finally:
             gateway.shutdown()
 

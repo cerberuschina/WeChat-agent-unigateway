@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -32,7 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_gateway import ilink  # noqa: E402
+from agent_gateway import ilink, ilink_media, media  # noqa: E402
 
 PLACEHOLDER = "{text}"
 SESSION_PLACEHOLDER = "{session}"
@@ -298,6 +299,7 @@ def main(argv: list | None = None) -> int:
             session = sessions.get(sender, "")
             answer = run_with_progress(runner, text, args, session, sender, client, message)
             answer, new_session = extract_session(answer)
+            answer, media_paths = extract_media_marks(answer)
             if new_session and new_session != session:
                 sessions[sender] = new_session
                 save_sessions(sessions_path, sessions)
@@ -310,10 +312,55 @@ def main(argv: list | None = None) -> int:
             chunks = [answer] if args.max_chars <= 0 else ilink.split_text(answer, args.max_chars)
             for chunk in chunks:
                 client.send_text(sender, chunk, context_token=message.get("context_token"))
+            for path in media_paths:
+                send_local_media(client, sender, path, message)
             handled += 1
             if args.once:
                 log("--once：处理完这条就退出。")
                 return 0
+
+
+def extract_media_marks(answer: str) -> tuple[str, list[str]]:
+    """Pull ``##FILE:<path>`` / ``##IMAGE:<path>`` lines out of the runner's output.
+
+    The runner is what knows it produced an artifact; it marks the path, and this
+    client turns the mark into a real attachment.
+    """
+    paths: list[str] = []
+    kept: list[str] = []
+    for line in answer.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("##FILE:", "##IMAGE:")):
+            path = stripped.split(":", 1)[1].strip()
+            if path:
+                paths.append(path)
+                continue
+        kept.append(line)
+    return "\n".join(kept).strip(), paths
+
+
+def send_local_media(client, sender: str, path: str, message: dict) -> None:
+    """Hand a local file to the gateway, which encrypts and uploads it.
+
+    The path travels as ``localpath:<abs>``: the gateway runs on this machine, so
+    it reads the file itself. Encryption and the CDN upload stay on the gateway
+    side, where the iLink credentials live.
+    """
+    try:
+        absolute = os.path.abspath(path)
+        if not os.path.isfile(absolute):
+            log(f"（{path} 不存在，跳过）")
+            return
+        item = media.build_media_item(
+            media.item_type_for(absolute),
+            encrypt_query_param=f"localpath:{absolute}",
+            aes_key=bytes(16), filename=os.path.basename(absolute),
+            plaintext_size=os.path.getsize(absolute), ciphertext_size=0)
+        ilink_media.send_items(client, sender, [item],
+                               context_token=message.get("context_token"))
+        log(f"（已交给网关发送附件：{os.path.basename(absolute)}）")
+    except Exception as exc:  # noqa: BLE001 - an attachment must not break the reply loop
+        log(f"（附件发不出去 {path}：{exc}）")
 
 
 if __name__ == "__main__":
