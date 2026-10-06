@@ -50,7 +50,10 @@ ERR_RATE_LIMIT = -2
 ERR_BAD_REQUEST = -501007
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 18500
+# The library default is an ephemeral port on purpose: a fixed default would let a
+# second instance (or a unit test) silently share the port a running gateway holds.
+# The gateway's own default comes from the config file (18500).
+DEFAULT_PORT = 0
 LONG_POLL_SECONDS = 30.0
 BIND_TTL_SECONDS = 600.0
 
@@ -149,6 +152,10 @@ class _AddressAwareServer(ThreadingHTTPServer):
     """
 
     dual_stack = True
+    # Windows lets a second process bind an address another one already holds when
+    # SO_REUSEADDR is on (http.server turns it on). Two gateways sharing a port is
+    # a silent mess, so refuse it loudly instead.
+    allow_reuse_address = False
 
     def __init__(self, address, handler, family=None):
         import socket

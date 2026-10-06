@@ -462,5 +462,17 @@ class RemoteAgentTests(unittest.TestCase):
         self.assertIsNone(self.server.read_media("peer/../../secret.txt"))
 
 
+class PortCollisionTests(unittest.TestCase):
+    def test_two_virtual_servers_cannot_share_a_port(self):
+        first = VirtualILinkServer(data_dir=Path(tempfile.mkdtemp()), port=0)
+        first.start()
+        try:
+            again = VirtualILinkServer(data_dir=Path(tempfile.mkdtemp()), port=first.port)
+            with self.assertRaises(OSError):
+                again.start()
+        finally:
+            first.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

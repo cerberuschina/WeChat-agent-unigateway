@@ -146,6 +146,19 @@ class VirtualConfig:
 
 
 @dataclass
+class DashboardConfig:
+    """本机网页控制台：看状态、批准接入。
+
+    Still stdlib-only and loopback by default: it is an operator tool, not another
+    exposed service.
+    """
+
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 18600
+
+
+@dataclass
 class Config:
     account: AccountConfig
     agents: Dict[str, AgentConfig]
@@ -154,6 +167,7 @@ class Config:
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     access: AccessConfig = field(default_factory=AccessConfig)
     virtual: VirtualConfig = field(default_factory=VirtualConfig)
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     source: Optional[Path] = None
 
     # -- lookups ---------------------------------------------------------
@@ -237,7 +251,8 @@ def load_config(path: str | os.PathLike[str]) -> Config:
     virtual = VirtualConfig(
         enabled=bool(virtual_raw.get("enabled", False)),
         host=str(virtual_raw.get("host") or "127.0.0.1"),
-        port=int(virtual_raw.get("port") or 18500),
+        # ``or`` would treat 0 (ephemeral port, used by tests) as "unset".
+        port=int(virtual_raw["port"]) if "port" in virtual_raw else 18500,
         auto_approve=[str(n) for n in (virtual_raw.get("auto_approve") or [])],
         reuse_real_token_for=str(virtual_raw.get("reuse_real_token_for") or "").lower(),
         reuse_token_env=str(virtual_raw.get("reuse_token_env") or ""),
@@ -251,6 +266,13 @@ def load_config(path: str | os.PathLike[str]) -> Config:
         raise ConfigError(
             f"virtual.reuse_real_token_for='{virtual.reuse_real_token_for}' is not a configured agent")
 
+    dashboard_raw = dict(raw.get("dashboard") or {})
+    dashboard = DashboardConfig(
+        enabled=bool(dashboard_raw.get("enabled", True)),
+        host=str(dashboard_raw.get("host") or "127.0.0.1"),
+        port=int(dashboard_raw["port"]) if "port" in dashboard_raw else 18600,
+    )
+
     cfg = Config(
         account=account,
         agents=agents,
@@ -259,6 +281,7 @@ def load_config(path: str | os.PathLike[str]) -> Config:
         delivery=delivery,
         access=access,
         virtual=virtual,
+        dashboard=dashboard,
         source=path,
     )
     if cfg.default_agent and cfg.default_agent not in cfg.agents:

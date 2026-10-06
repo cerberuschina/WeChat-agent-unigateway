@@ -185,6 +185,7 @@ clients/ilink_agent_client.py   把任意 agent 挂到微信上的客户端（�
 examples/virtual_loop_demo.py   一条命令跑完"虚拟 iLink"全流程（真客户端，不联网）
 bridges/           可选桥：bridges/electron_cdp.py 用 CDP 驱动只有桌面版的 agent
 docs/VIRTUAL-ILINK.md       虚拟 iLink 的设计、接法、批准流程、边界
+docs/DASHBOARD.md           控制台：看状态、批准接入（本机网页，零依赖）
 docs/REMOTE-AGENTS.md       非本机 agent 接入：bind_key、上传/下载、安全边界
 docs/PROTOCOL.md            iLink 协议实测要点
 docs/BACKENDS-WORKBUDDY.md  WorkBuddy 实测结论 + 两条接法

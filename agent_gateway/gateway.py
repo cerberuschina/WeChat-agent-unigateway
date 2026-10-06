@@ -55,6 +55,10 @@ class Gateway:
         # so count them per peer and keep the tail for the next turn.
         self._turn_counts: Dict[str, int] = {}
         self._pending_output: Dict[str, str] = {}
+        # Console: a message ring, a log ring and the little HTTP server itself.
+        self.traffic = None
+        self.log_ring = None
+        self.dashboard = None
         self.virtual: Optional[VirtualILinkServer] = None
 
     # -- account ---------------------------------------------------------
@@ -120,6 +124,7 @@ class Gateway:
             log.info("dropped a progress note for %s: %d slot(s) left this turn", _safe(chat_id), left)
             return
         context_token = self.client.context_token(chat_id)
+        self._record("out", chat_id, "", text)
         # WeChat renders no Markdown and refuses oversized items, so rendering and
         # splitting belong to the channel layer — the agent sends what it means.
         chunks = markdown.prepare(text, self.cfg.delivery.max_chars_per_message)
@@ -354,6 +359,7 @@ class Gateway:
             self._send(sender, f"「{agent.display}」还没接入：让它在自己那边发起一次微信扫码登录，"
                                f"然后在这里批准 → {self.virtual.base_url()}/admin/binds")
             return
+        self._record("in", sender, agent.name, text)
         if self.cfg.delivery.ack and not self.dry_run:
             self._send(sender, self.cfg.delivery.ack_template.format(label=agent.display))
         # The agent answers whenever it is done; hold 「正在输入」 until then.
@@ -431,6 +437,7 @@ class Gateway:
             bind = self.virtual.bind_named(agent.name)
             state = f"已接入 {bind.account_id}" if bind else "还没接入（等它在自己那边发起扫码登录）"
             print(f"  · {agent.name:<10} {state}")
+        self._start_dashboard()
 
     def _forward_to_wechat(self, bind, text: str) -> None:
         """A virtual agent answered: push it out through the real WeChat identity."""
@@ -465,6 +472,87 @@ class Gateway:
             log.info("attachment -> %s: %s (%d bytes)", _safe(chat_id), path.name, path.stat().st_size)
         except ilink.ILinkError as exc:
             log.error("attachment to %s failed: %s", _safe(chat_id), exc)
+
+    # -- console (dashboard) ---------------------------------------------
+    def _record(self, kind: str, peer: str, agent: str = "", text: str = "") -> None:
+        """Keep the recent message flow so the console can show it live."""
+        if self.traffic is not None:
+            self.traffic.add(kind, peer, agent, text)
+
+    def snapshot(self) -> dict:
+        """Everything the console page shows, as one JSON-able dict."""
+        agents = []
+        for agent in self.cfg.enabled_agents():
+            # Only a virtual agent has a bind; an a2a/http/exec agent is simply reachable.
+            bind = (self.virtual.bind_named(agent.name)
+                    if self.virtual and agent.type == "virtual" else None)
+            agents.append({
+                "name": agent.name, "label": agent.label, "type": agent.type,
+                "bound": bool(bind), "prefix": agent.prefix,
+                "account_id": bind.account_id if bind else "",
+                "queue": len(bind.queue) if bind else 0,
+                "last_seen": bind.last_seen if bind else 0,
+            })
+        virtual: dict = {"enabled": self.cfg.virtual.enabled}
+        if self.virtual:
+            binds = self.virtual.binds()
+            virtual.update({
+                "host": self.virtual.host, "port": self.virtual.port,
+                "bind_key": bool(self.cfg.virtual.bind_key),
+                "allow_cidrs": self.virtual.allow_cidrs,
+                "admin_cidrs": self.virtual.admin_cidrs,
+                "pending": [b for b in binds if not b.get("confirmed")],
+                "binds": binds,
+            })
+        return {
+            "running": True,
+            "account": _safe(self.client.account_id if self.client else self.cfg.account.account_id),
+            "base_url": self.cfg.account.base_url,
+            "virtual_url": self.virtual.base_url() if self.virtual else "",
+            "default_agent": self.cfg.default_agent,
+            "dry_run": self.dry_run,
+            "agents": agents,
+            "virtual": virtual,
+            "delivery": {
+                "max_messages_per_turn": self.cfg.delivery.max_messages_per_turn,
+                "reserve_for_answer": self.cfg.delivery.reserve_for_answer,
+                "max_chars_per_message": self.cfg.delivery.max_chars_per_message,
+                "per_peer": {peer: {"used": used, "left": self._budget_left(peer)}
+                             for peer, used in list(self._turn_counts.items())},
+            },
+            "pending_output": {peer: len(text) for peer, text in self._pending_output.items()},
+        }
+
+    def _start_dashboard(self) -> None:
+        """Start the operator console (its own thread; loopback by default)."""
+        if not self.cfg.dashboard.enabled:
+            return
+        from .dashboard import Dashboard, LogRing, TrafficRing
+
+        self.log_ring = LogRing()
+        self.log_ring.setFormatter(logging.Formatter("%(message)s"))
+        logging.getLogger("agent_gateway").addHandler(self.log_ring)
+        self.traffic = TrafficRing()
+        self.dashboard = Dashboard(
+            snapshot=self.snapshot,
+            approve=lambda qrcode, name: (self.virtual.approve(qrcode, name=name)
+                                          if self.virtual else None),
+            reject=lambda qrcode: (self.virtual.reject(qrcode) if self.virtual else False),
+            may_admin=lambda ip: (self.virtual.may_admin(ip) if self.virtual
+                                  else ip in ("127.0.0.1", "::1")),
+            logs=self.log_ring, traffic=self.traffic,
+            host=self.cfg.dashboard.host, port=self.cfg.dashboard.port,
+            on_log=log.info,
+        )
+        try:
+            self.dashboard.start()
+        except OSError as exc:
+            # The console is a nicety; a busy port must never take the gateway down.
+            log.warning("console did not start (port %s busy?): %s", self.cfg.dashboard.port, exc)
+            print(f"\n⚠️ 控制台没起来（端口 {self.cfg.dashboard.port} 被占用？）：{exc}")
+            self.dashboard = None
+            return
+        print(f"\n控制台：{self.dashboard.base_url()}（浏览器打开；默认只允许本机访问）")
 
     def _forward_media_to_wechat(self, bind, items: list) -> None:
         """A virtual agent wants to send files: the gateway does the real upload.
@@ -513,6 +601,9 @@ class Gateway:
         self._stop.set()
 
     def shutdown(self) -> None:
+        if self.dashboard:
+            self.dashboard.stop()
+            self.dashboard = None
         if self.virtual:
             self.virtual.stop()
         self._pool.shutdown(wait=False)
