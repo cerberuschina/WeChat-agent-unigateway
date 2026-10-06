@@ -185,6 +185,8 @@ class VirtualILinkServer:
                  on_outbound_items: Optional[Callable[[VirtualBind, List[Dict[str, Any]]], None]] = None,
                  on_typing: Optional[Callable[[VirtualBind, int], None]] = None,
                  bind_key: str = "", public_url: str = "",
+                 allow_cidrs: Optional[List[str]] = None,
+                 admin_cidrs: Optional[List[str]] = None,
                  on_log: Optional[Callable[[str], None]] = None):
         self.host = host
         self.port = port
@@ -204,6 +206,9 @@ class VirtualILinkServer:
         # fetch media they cannot read from this machine's disk.
         self.bind_key = bind_key or ""
         self.public_url = (public_url or "").rstrip("/")
+        self.allow_cidrs = [str(c) for c in (allow_cidrs or [])]
+        # 默认只有本机能批准：公网暴露时，"人工批准"只有在这一条成立时才有意义。
+        self.admin_cidrs = [str(c) for c in (admin_cidrs or ["127.0.0.1/32", "::1/128"])]
         self.uploads: Dict[str, Dict[str, Any]] = {}
         self.upload_dir = self.dir / "uploads"
         self._log = on_log or (lambda _m: None)
@@ -345,6 +350,48 @@ class VirtualILinkServer:
         return f"http://{host}:{self.port}"
 
     # -- endpoint bodies (also directly unit-testable) -------------------
+    # -- access policy (public exposure) ---------------------------------
+    def _ip_in(self, ip: str, cidrs: List[str]) -> bool:
+        """CIDR match that also accepts a bare address (``::1`` == ``::1/128``)."""
+        import ipaddress
+        try:
+            address = ipaddress.ip_address((ip or "").strip("[]"))
+        except ValueError:
+            return False
+        for entry in cidrs or []:
+            try:
+                network = ipaddress.ip_network(str(entry).strip(), strict=False)
+            except ValueError:
+                continue
+            if address in network:
+                return True
+        return False
+
+    def may_admin(self, ip: str) -> bool:
+        """Approving and listing binds is for admin networks only (default: localhost).
+
+        Without this, exposing the port publicly would let a stranger approve their
+        own bind — the operator's approval only means something if the operator is
+        the only one who can press it.
+        """
+        return self._ip_in(ip, self.admin_cidrs)
+
+    def may_use_api(self, ip: str) -> bool:
+        """Agent-facing endpoints: allow-listed when configured.
+
+        Empty ``allow_cidrs`` means "no network restriction" — binding still needs
+        the pre-shared key, an identity token, and a human approval.
+        """
+        if not self.allow_cidrs:
+            return True
+        return self._ip_in(ip, self.allow_cidrs)
+
+    def policy_hint(self) -> str:
+        if not self.allow_cidrs:
+            return ("未设置 allow_cidrs：能连到这个端口的机器都可以请求接入"
+                    "（仍需 bind_key + 人工批准）。公网暴露请写明白名单。")
+        return f"白名单：{', '.join(self.allow_cidrs)}"
+
     # -- remote (non-local) agents ---------------------------------------
     def public_base(self) -> str:
         """The address agents should use to reach us (``public_url`` wins)."""
@@ -508,12 +555,34 @@ def _make_handler(server: VirtualILinkServer):
             return auth[7:].strip() if auth.lower().startswith("bearer ") else ""
 
         # -- routes -----------------------------------------------------
+        def _deny(self, admin: bool) -> bool:
+            """Answer 403 (and return True) when this client may not use the route.
+
+            Admin routes (approval, bind list, health) default to localhost only;
+            agent routes honour ``allow_cidrs`` when it is configured.
+            """
+            ip = (self.client_address or ("?",))[0]
+            if (server.may_admin(ip) if admin else server.may_use_api(ip)):
+                return False
+            server._log(f"refused {'admin' if admin else 'agent'} request from {ip}")
+            self._send({"ok": False, "error": "forbidden",
+                        "hint": "管理接口默认只允许本机；公网接入请配置 allow_cidrs / admin_cidrs"},
+                       status=403)
+            return True
+
         def do_GET(self) -> None:  # noqa: N802
             path, _, query = self.path.partition("?")
             params = dict(urllib.parse.parse_qsl(query))
 
+            if path.startswith(("/admin/", "/bind/")) or path in ("/", "/health"):
+                if self._deny(admin=True):
+                    return
+            elif self._deny(admin=False):
+                return
+
             if path == "/ilink/bot/get_bot_qrcode":
                 key = params.get("key") or self.headers.get("X-Bind-Key") or ""
+                server._log(f"virtual: 取码请求来自 {self.client_address[0]}")
                 self._send(server.ep_qrcode(key))
                 return
             if path == "/ilink/bot/get_qrcode_status":
@@ -560,6 +629,12 @@ def _make_handler(server: VirtualILinkServer):
         def do_POST(self) -> None:  # noqa: N802
             path, _, query = self.path.partition("?")
             params = dict(urllib.parse.parse_qsl(query))
+
+            if path.startswith("/admin/"):
+                if self._deny(admin=True):
+                    return
+            elif self._deny(admin=False):
+                return
 
             if path == "/upload":
                 # 远程 agent 把文件字节推过来（它的路径在这边没有意义）

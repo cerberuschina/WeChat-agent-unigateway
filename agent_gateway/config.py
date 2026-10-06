@@ -120,6 +120,10 @@ class VirtualConfig:
     # for anything beyond a trusted LAN, put an SSH tunnel or a reverse proxy with
     # a real certificate in front (see docs/REMOTE-AGENTS.md).
     public_url: str = ""
+    # Public exposure: who may talk to the agent API at all (empty = 不限制来源，
+    # 仍要 bind_key + token + 人工批准), and who may approve/list binds.
+    allow_cidrs: List[str] = field(default_factory=list)
+    admin_cidrs: List[str] = field(default_factory=lambda: ["127.0.0.1/32", "::1/128"])
 
     def approves(self, name: str) -> bool:
         return (name or "").lower() in [n.lower() for n in self.auto_approve]
@@ -240,6 +244,8 @@ def load_config(path: str | os.PathLike[str]) -> Config:
         reuse_token_file=str(virtual_raw.get("reuse_token_file") or ""),
         bind_key=str(virtual_raw.get("bind_key") or ""),
         public_url=str(virtual_raw.get("public_url") or "").rstrip("/"),
+        allow_cidrs=[str(c) for c in (virtual_raw.get("allow_cidrs") or [])],
+        admin_cidrs=[str(c) for c in (virtual_raw.get("admin_cidrs") or [])],
     )
     if virtual.reuse_real_token_for and virtual.reuse_real_token_for not in agents:
         raise ConfigError(

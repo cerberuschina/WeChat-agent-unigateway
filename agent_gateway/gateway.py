@@ -412,12 +412,17 @@ class Gateway:
             on_typing=self._agent_typing,
             bind_key=self.cfg.virtual.bind_key,
             public_url=self.cfg.virtual.public_url,
+            allow_cidrs=self.cfg.virtual.allow_cidrs,
+            admin_cidrs=self.cfg.virtual.admin_cidrs,
             on_log=log.info,
         )
         host, port = self.virtual.start()
         print(f"\n虚拟 iLink 已就绪：{self.virtual.base_url()}")
         print("  把 agent 的微信 base_url 指到这里，它就等于接上了微信（例：Hermes 用 WEIXIN_BASE_URL）")
         print(f"  待批准的接入：{self.virtual.base_url()}/admin/binds\n")
+        print(f"  管理接口（批准/列表）允许的来源：{', '.join(self.virtual.admin_cidrs)}")
+        if self.cfg.virtual.host not in ("127.0.0.1", "localhost", "::1"):
+            print(f"  ⚠️ 监听 {self.cfg.virtual.host}：{self.virtual.policy_hint()}\n")
         if reused:
             print(f"  已复用真 token 的 agent：{reused}（它原来的微信绑定不用改，直接指过来即可）\n")
         for agent in self.cfg.enabled_agents():

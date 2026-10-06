@@ -18,7 +18,15 @@
     "auto_approve": ["claude"],
     "_auto_approve": "这些 agent 免人工批准：它们扫码时自动拿到网关签发的虚拟身份",
     "reuse_real_token_for": "hermes",
-    "_reuse_real_token_for": "已经绑过真微信的 agent 写在这里：它连 token 都不用换，指过 base_url 就能用"
+    "_reuse_real_token_for": "已经绑过真微信的 agent 写在这里：它连 token 都不用换，指过 base_url 就能用",
+    "bind_key": "",
+    "_bind_key": "远程/公网接入时必填：agent 取码要带这个预共享密钥",
+    "public_url": "",
+    "_public_url": "远程 agent 用的可达地址，例如 http://192.168.1.5:18500 或 http://[240e::5]:18500",
+    "allow_cidrs": [],
+    "_allow_cidrs": "agent 接口的来源白名单（IPv4/IPv6 均可）；空 = 不限来源（仍要 bind_key + token + 人工批准）",
+    "admin_cidrs": ["127.0.0.1/32", "::1/128"],
+    "_admin_cidrs": "批准页/列表/health 只对这些网段开放——公网暴露时靠它保证'人工批准'只有你能按"
   },
 
   "agents": {
