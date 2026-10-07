@@ -180,7 +180,8 @@ class ClaudeStreamSession:
                                      interrupted=stop in ("interrupted", "max_turns"),
                                      raw=event))
                 self._text.clear()
-            elif kind not in ("system",):
+            elif kind not in ("system", "user", "control_response", "control_request"):
+                # system 是真进程的噪音；user / control_* 是我们自己喂进去的东西被回显。
                 self.log(f"（事件 {kind}）")
         self.log("会话的标准输出关了")
 
