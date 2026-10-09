@@ -83,6 +83,107 @@ class BindFlowTests(unittest.TestCase):
         self.assertIsNone(self.server._bind_for_token("bogus"))
 
 
+class BindPersistenceTests(unittest.TestCase):
+    """A gateway restart must not cost the agent another scan.
+
+    The agent keeps the token it was handed; the whole point of writing binds to
+    disk is that ``_bind_for_token`` still recognises it afterwards.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _server(self, **kwargs) -> VirtualILinkServer:
+        return VirtualILinkServer(data_dir=self.dir, **kwargs)
+
+    def test_identity_and_token_survive_a_restart(self):
+        first = self._server()
+        try:
+            bind = first.ensure_bind("hermes", issued=True)
+            account_id, token = bind.account_id, bind.token
+        finally:
+            first.stop()
+
+        second = self._server()
+        try:
+            restored = second.bind_named("hermes")
+            self.assertIsNotNone(restored, "重启后身份应当还在")
+            self.assertEqual(restored.account_id, account_id)
+            self.assertEqual(restored.token, token)
+            self.assertIs(second._bind_for_token(token), restored,
+                          "agent 手里的 token 必须仍然认得出它")
+            self.assertFalse(restored.expired)
+        finally:
+            second.stop()
+
+    def test_unapproved_bind_is_not_restored(self):
+        first = self._server()
+        try:
+            first.request_bind("stranger")
+        finally:
+            first.stop()
+
+        second = self._server()
+        try:
+            self.assertIsNone(second.bind_named("stranger"), "没批准过的接入不该复活")
+            self.assertEqual(second.agent_names(), [])
+        finally:
+            second.stop()
+
+    def test_cursor_and_context_token_come_back(self):
+        first = self._server(auto_approve=["claude"])
+        try:
+            first.ensure_bind("claude", issued=True)
+            first.deliver("claude", text="hi", peer="wx-1", context_token="ctx-1")
+            first.bind_named("claude").drain("", timeout=0.2)
+            seq = first.bind_named("claude").cursor_seq
+        finally:
+            first.stop()
+
+        second = self._server(auto_approve=["claude"])
+        try:
+            restored = second.bind_named("claude")
+            self.assertEqual(restored.cursor_seq, seq)
+            self.assertEqual(restored.context_tokens.get("wx-1"), "ctx-1")
+        finally:
+            second.stop()
+
+    def test_restored_identity_is_not_handed_to_a_new_agent(self):
+        first = self._server(auto_approve=["claude"])
+        try:
+            first.ensure_bind("claude", issued=True)
+        finally:
+            first.stop()
+
+        second = self._server(auto_approve=["claude"])
+        try:
+            fresh = second.ep_qrcode()["qrcode"]
+            self.assertEqual(second.ep_qrcode_status(fresh)["status"], "wait",
+                             "已发出的身份不能再发给另一个 agent")
+            self.assertNotEqual(second.bind_named("claude").qrcode, fresh)
+        finally:
+            second.stop()
+
+    def test_rejected_bind_does_not_come_back(self):
+        first = self._server()
+        try:
+            bind = first.request_bind("gone")
+            first.approve(bind.qrcode)
+            first.reject(bind.qrcode)
+        finally:
+            first.stop()
+
+        second = self._server()
+        try:
+            self.assertIsNone(second.bind_named("gone"))
+        finally:
+            second.stop()
+
+
 class MessageFlowTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

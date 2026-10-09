@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import media
+from .store import _atomic_write, _read_json
 
 RET_OK = 0
 ERR_SESSION_EXPIRED = -14
@@ -109,6 +110,45 @@ class VirtualBind:
             "queue": len(self.queue),
             "cursor_seq": self.cursor_seq,
         }
+
+    # -- persistence -----------------------------------------------------
+    # What must survive a restart is the identity the agent *already holds*: it
+    # logged in once, kept its token, and has no reason to scan again. The
+    # message queue is deliberately left out — a message that never reached the
+    # agent is gone from the real side too, so replaying it would double-deliver.
+    def to_state(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "note": self.note,
+            "qrcode": self.qrcode,
+            "account_id": self.account_id,
+            "token": self.token,
+            "created_at": self.created_at,
+            "confirmed_at": self.confirmed_at,
+            "cursor": self.cursor,
+            "cursor_seq": self.cursor_seq,
+            "last_peer": self.last_peer,
+            "qr_issued": self.qr_issued,
+            "context_tokens": dict(self.context_tokens),
+        }
+
+    @classmethod
+    def from_state(cls, data: Dict[str, Any]) -> "VirtualBind":
+        bind = cls(str(data.get("name") or "agent"), note=str(data.get("note") or ""))
+        bind.qrcode = str(data.get("qrcode") or bind.qrcode)
+        bind.account_id = str(data.get("account_id") or bind.account_id)
+        bind.token = str(data.get("token") or bind.token)
+        bind.created_at = float(data.get("created_at") or bind.created_at)
+        confirmed_at = data.get("confirmed_at")
+        bind.confirmed_at = float(confirmed_at) if confirmed_at else None
+        bind.cursor = str(data.get("cursor") or bind.cursor)
+        bind.cursor_seq = int(data.get("cursor_seq") or 0)
+        bind.last_peer = str(data.get("last_peer") or "")
+        bind.qr_issued = bool(data.get("qr_issued"))
+        tokens = data.get("context_tokens")
+        bind.context_tokens = ({str(k): str(v) for k, v in tokens.items()}
+                               if isinstance(tokens, dict) else {})
+        return bind
 
     # -- message pump ----------------------------------------------------
     def deliver(self, *, text: str, peer: str, message_id: str = "",
@@ -233,8 +273,44 @@ class VirtualILinkServer:
         self._by_token: Dict[str, VirtualBind] = {}
         # peer -> deadline: "/stop" requests waiting for their agent to notice.
         self._stops: Dict[str, float] = {}
+        self._state_path = self.dir / "binds.json"
+        self._load_state()
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
+
+    # -- persistence -----------------------------------------------------
+    def _load_state(self) -> None:
+        """Rebuild the identities agents already hold, so a restart is not a re-login.
+
+        Only *confirmed* binds are restored: a pending bind is an unfinished
+        approval, and replaying one would silently re-open a scan window.
+        """
+        raw = _read_json(self._state_path, {}) or {}
+        restored = 0
+        for item in raw.get("binds") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                bind = VirtualBind.from_state(item)
+            except (TypeError, ValueError):
+                continue
+            if not bind.confirmed:
+                continue
+            self._binds[bind.qrcode] = bind
+            self._by_token[bind.token] = bind
+            restored += 1
+        if restored:
+            self._log(f"virtual: restored {restored} bind(s) from {self._state_path.name}")
+
+    def _persist(self) -> None:
+        with self._lock:
+            binds = list(self._binds.values())
+        snapshot = []
+        for bind in binds:
+            if bind.confirmed:
+                with bind.lock:
+                    snapshot.append(bind.to_state())
+        _atomic_write(self._state_path, {"binds": snapshot})
 
     # -- state -----------------------------------------------------------
     def binds(self) -> List[Dict[str, Any]]:
@@ -276,6 +352,7 @@ class VirtualILinkServer:
                 bind.confirmed_at = time.time()
                 self._by_token[bind.token] = bind
         self._log(f"virtual: approved {bind.name} as {bind.account_id}")
+        self._persist()
         return bind
 
     def reject(self, qrcode: str) -> bool:
@@ -283,7 +360,10 @@ class VirtualILinkServer:
             bind = self._binds.pop(qrcode, None)
             if bind:
                 self._by_token.pop(bind.token, None)
-            return bind is not None
+            removed = bind is not None
+        if removed:
+            self._persist()
+        return removed
 
     def ensure_bind(self, name: str, *, issued: bool = True) -> VirtualBind:
         """Get (or create) a confirmed identity for a named agent.
@@ -299,6 +379,9 @@ class VirtualILinkServer:
         if not bind.confirmed:
             self.approve(bind.qrcode, name=name)
         bind.qr_issued = issued
+        # approve() already wrote the bind; this records that the credentials are
+        # spoken for, so a restart cannot hand the same identity to a second agent.
+        self._persist()
         return bind
 
     def _bind_for_token(self, token: str) -> Optional[VirtualBind]:
@@ -345,6 +428,7 @@ class VirtualILinkServer:
         if not bind:
             return False
         bind.deliver(text=text, peer=peer, message_id=message_id, context_token=context_token)
+        self._persist()
         self._log(f"virtual: -> {bind.name} {text[:60]!r}")
         return True
 
@@ -499,9 +583,11 @@ class VirtualILinkServer:
                 if bind.confirmed and not bind.qr_issued and not bind.expired:
                     bind.qr_issued = True
                     self._log(f"virtual: handing the credentials of {bind.name} to an agent")
+                    self._persist()
                     return bind
         bind = self.request_bind()
         bind.qr_issued = True
+        self._persist()
         return bind
 
     def ep_qrcode(self, key: str = "") -> Dict[str, Any]:
@@ -528,6 +614,9 @@ class VirtualILinkServer:
     def ep_getupdates(self, bind: VirtualBind, payload: Dict[str, Any],
                       timeout: float = LONG_POLL_SECONDS) -> Dict[str, Any]:
         cursor, messages = bind.drain(str(payload.get("get_updates_buf") or ""), timeout)
+        if messages:
+            # The cursor moved, so the resume point is now worth a write.
+            self._persist()
         return {"ret": RET_OK, "msgs": messages, "get_updates_buf": cursor}
 
     def ep_sendmessage(self, bind: VirtualBind, payload: Dict[str, Any]) -> Dict[str, Any]:

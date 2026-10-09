@@ -159,7 +159,9 @@ python clients/ilink_agent_client.py --name claude \
 真微信 ─► 网关 ─► 虚拟队列 ─► 客户端长轮询 ─► claude -p ─► sendmessage ─► 网关 ─► 真微信
 ```
 
-游标跟着凭证落盘，重启不重放旧消息；身份失效（网关重启过）会自动重新扫码。
+游标跟着凭证落盘，重启不重放旧消息；**虚拟身份也一起落盘**（`data/virtual/binds.json`），
+所以网关重启后 agent 手里的 token 照样认得出它，不必重扫。只有待转发的消息队列不落盘——
+队列里没送到的消息在真微信那一侧也已经消费掉了，重放等于重复投递。
 
 > 写测试脚本时注意：网关的去重是**跨重启**的——同一条测试消息（同 message_id 或同内容）
 > 第二次会被当成重复丢掉。每次换个 message_id，或者清掉 data_dir。
@@ -230,7 +232,7 @@ python clients/ilink_agent_client.py --name claude \
 | 语音 / 视频 | 类型分支已实现（item 3/5），但没实测；收到时会按"媒体"落盘并把路径交给 agent |
 | 群聊 | 不支持（iLink 的 bot 身份通常收不到群消息） |
 | 多真微信号 | 不支持：网关只持有一个真身份（这正是它的意义） |
-| 虚拟身份的持久化 | 绑定目前**只在进程内存**里：重启网关，agent 需要重新走一次扫码（它的 token 失效会得到 `ret=-14`，行为与真实 iLink 一致） |
+| 虚拟身份的持久化 | **已落盘**：绑定写进 `data/virtual/binds.json`（身份 + token + 游标 + context_token），重启后自动恢复，agent 不用重扫。未批准过的绑定和待转发的队列不落盘 |
 
 ## 安全边界
 

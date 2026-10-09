@@ -199,13 +199,14 @@ python -m agent_gateway --config gateway.json
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -t .     # 282 项，全部离线（不联网、不碰微信）
+python -m unittest discover -s tests -t .     # 326 项，全部离线（不联网、不碰微信）
 ```
 
 测试覆盖：路由语法（含命令与 agent 前缀冲突）、A2A 回复提取、exec 后端（argv/stdin/超时/非零退出）、
 iLink 解析与错误映射、**干跑模式下的端到端**（一条微信消息从去重 → 路由 → 后端/虚拟队列 → 回复）、
 **虚拟 iLink 的完整登录闭环**（HTTP 层：取码 → 待批准 → 批准 → 拿虚拟身份 → 带 token 调用）、
 **真 token 复用**（已绑过的 agent 不改 token 就能被接住，且它的身份不会被别人扫码领走）、
+**虚拟身份落盘**（重启后同一个 token 仍然认得出同一个身份，未批准的接入和不属于它的新 agent 都拿不走）、
 以及 CDP 桥的选择器档案与 JS 片段。
 
 ## 目录
@@ -231,7 +232,7 @@ docs/PROTOCOL.md            iLink 协议实测要点
 docs/BACKENDS-WORKBUDDY.md  WorkBuddy 实测结论 + 两条接法
 docs/JOIN.md               一键接入：每种 agent 一条命令、改了什么、怎么排错
 docs/SWITCH.md              把微信切到网关的步骤（含回滚）
-tests/             314 项离线测试
+tests/             326 项离线测试
 ```
 
 ## 已知限制 / Roadmap
@@ -241,8 +242,8 @@ tests/             314 项离线测试
 - [ ] 群聊（取决于 iLink 是否给这个身份下发群事件）
 - [ ] 一条消息并发问多个 agent（`/all`）与结果汇总
 - [ ] WorkBuddy 之类的桌面应用适配（只有本地 API / 无 CLI 的场景）
-- [ ] 虚拟身份落盘：现在虚拟号只在内存里，网关重启后 agent 要重新扫码（它的 token 会收到
-      `ret=-14`，与真实 iLink 的失效行为一致）
+- [x] 虚拟身份落盘：绑定（身份 + token + 游标 + context_token）写进 `data/virtual/binds.json`，
+      网关重启后 agent 不用重扫，手里的 token 照样认得出它
 - [ ] 开机自启脚本（Windows Startup / systemd unit）
 
 ## License
