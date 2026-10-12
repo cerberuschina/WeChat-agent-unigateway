@@ -125,7 +125,15 @@ class OutboundMediaTests(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.gateway = build_gateway(self.tmp)
         self.sent_files = []
+        self.sent_items = []
         self._real_send_file = ilink_media.send_file
+        self._real_send_items = ilink_media.send_items
+
+        def fake_send_items(client, to, items, *, context_token=None):
+            self.sent_items.append((to, items, context_token))
+            return {"ret": 0}
+
+        ilink_media.send_items = fake_send_items
 
         def fake_send_file(client, to, path, *, context_token=None, caption=""):
             self.sent_files.append((to, Path(path), context_token))
@@ -137,6 +145,7 @@ class OutboundMediaTests(unittest.TestCase):
 
     def tearDown(self):
         ilink_media.send_file = self._real_send_file
+        ilink_media.send_items = self._real_send_items
         self.gateway.shutdown()
         self._tmp.cleanup()
 
@@ -165,10 +174,24 @@ class OutboundMediaTests(unittest.TestCase):
         self.gateway._forward_media_to_wechat(bind, [self.item_for(self.tmp / "nope.pdf")])
         self.assertEqual(self.sent_files, [])
 
-    def test_a_foreign_media_item_is_not_guessed_at(self):
+    def test_an_item_the_agent_already_uploaded_is_forwarded_as_it_came(self):
+        """Hermes 这类真 iLink 客户端自己加密上传，网关只剩转发这一步。"""
         bind = self.bind()
-        self.gateway._forward_media_to_wechat(bind, [file_item(query="EQP-from-elsewhere")])
-        self.assertEqual(self.sent_files, [])
+        item = file_item(query="EQP-uploaded-by-the-agent")
+        self.gateway._forward_media_to_wechat(bind, [item])
+        self.assertEqual(self.sent_files, [], "不该再走一遍网关自己的上传")
+        self.assertEqual(len(self.sent_items), 1)
+        self.assertEqual(self.sent_items[0][0], "wx-user")
+        self.assertEqual(self.sent_items[0][1][0]["file_item"]["media"]["encrypt_query_param"],
+                         "EQP-uploaded-by-the-agent")
+        self.assertEqual(self.gateway._turn_counts["wx-user"], 1, "附件也占额度")
+
+    def test_an_agent_uploaded_item_is_dropped_when_the_budget_is_gone(self):
+        bind = self.bind()
+        self.gateway._turn_counts["wx-user"] = self.gateway.cfg.delivery.max_messages_per_turn
+        self.gateway._forward_media_to_wechat(bind, [file_item(query="EQP-1")])
+        self.assertEqual(self.sent_items, [])
+        self.assertIn("额度用完", self.gateway._pending_output["wx-user"])
 
     def test_no_budget_means_no_attachment_and_a_note(self):
         bind = self.bind()

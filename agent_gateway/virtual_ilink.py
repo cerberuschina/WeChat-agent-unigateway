@@ -233,6 +233,7 @@ class VirtualILinkServer:
                  accept_tokens: Optional[Dict[str, str]] = None,
                  on_outbound: Optional[Callable[[VirtualBind, str], None]] = None,
                  on_outbound_items: Optional[Callable[[VirtualBind, List[Dict[str, Any]]], None]] = None,
+                 on_get_upload_url: Optional[Callable[[VirtualBind, Dict[str, Any]], Dict[str, Any]]] = None,
                  on_typing: Optional[Callable[[VirtualBind, int], None]] = None,
                  approvals: Optional[Any] = None,
                  on_approval: Optional[Callable[[VirtualBind, Any], None]] = None,
@@ -251,6 +252,10 @@ class VirtualILinkServer:
         # Media a virtual agent wants delivered: the gateway turns these into real
         # iLink items (upload + encrypt) on its own way out.
         self.on_outbound_items = on_outbound_items
+        # Or the agent uploads by itself: it asks here for the real upload
+        # parameters and POSTs the ciphertext to the CDN on its own. With no
+        # callback there is nothing to answer with, and the agent is told so.
+        self.on_get_upload_url = on_get_upload_url
         # Heartbeats from an agent ("still working") — the gateway holds the real
         # typing indicator; nothing is sent to WeChat for these.
         self.on_typing = on_typing
@@ -880,8 +885,19 @@ def _make_handler(server: VirtualILinkServer):
                 self._send({"ret": RET_OK, "typing_ticket": ""})
                 return
             if path == "/ilink/bot/getuploadurl":
-                self._send({"ret": ERR_BAD_REQUEST,
-                            "errmsg": "virtual gateway: media upload not supported yet"})
+                # Upload parameters belong to the *real* bot identity, so they can
+                # only come from the gateway's real iLink connection: the agent
+                # encrypts and POSTs the bytes itself, we relay iLink's answer.
+                if not server.on_get_upload_url:
+                    self._send({"ret": ERR_BAD_REQUEST,
+                                "errmsg": "virtual gateway: media upload not supported yet"})
+                    return
+                try:
+                    self._send(server.on_get_upload_url(bind, payload))
+                except Exception as exc:  # noqa: BLE001
+                    server._log(f"virtual: getuploadurl failed: {exc}")
+                    self._send({"ret": ERR_BAD_REQUEST,
+                                "errmsg": f"virtual gateway: getuploadurl failed: {exc}"})
                 return
             self._send({"ret": ERR_BAD_REQUEST, "errmsg": f"virtual gateway: no such endpoint {path}"})
 

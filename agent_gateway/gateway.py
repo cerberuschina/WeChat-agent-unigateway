@@ -460,6 +460,7 @@ class Gateway:
             accept_tokens=self.cfg.virtual.reuse_tokens(self.cfg.account.token),
             on_outbound=self._forward_to_wechat,
             on_outbound_items=self._forward_media_to_wechat,
+            on_get_upload_url=self._get_upload_url,
             on_typing=self._agent_typing,
             approvals=self.approvals,
             on_approval=self._approval_asked,
@@ -499,6 +500,39 @@ class Gateway:
     def _budget_left(self, chat_id: str) -> int:
         return max(0, max(1, int(self.cfg.delivery.max_messages_per_turn))
                    - self._turn_counts.get(chat_id, 0))
+
+    def _get_upload_url(self, bind, payload: dict) -> dict:
+        """Real upload parameters for a virtual agent that uploads by itself.
+
+        The agent (Hermes' weixin channel) does encrypt-and-POST to WeChat's CDN on
+        its own; what it cannot do is *ask* for the parameters, because that call
+        must carry the real bot token. So we make that one call for it and pass
+        iLink's answer back verbatim.
+        """
+        if self.dry_run or self.client is None:
+            return {"ret": -501007, "errmsg": "virtual gateway: 没有可用的真 iLink 连接"}
+        return ilink_media.request_upload_url(self.client, payload)
+
+    def _send_media_item(self, chat_id: str, item: dict) -> None:
+        """Forward one item the *agent* already encrypted and uploaded.
+
+        Nothing is re-uploaded here: the item carries a real ``encrypt_query_param``
+        from iLink's CDN, so it is sendable as it stands.
+        """
+        if self.dry_run or self.client is None:
+            log.info("[dry-run] 附件（agent 已自传）-> %s", _safe(chat_id))
+            return
+        if self._budget_left(chat_id) <= 0:
+            self._queue_pending(chat_id, "（这一轮消息额度用完了，附件没发出去）")
+            log.warning("no message budget left for %s; agent-uploaded attachment not sent", _safe(chat_id))
+            return
+        try:
+            ilink_media.send_items(self.client, chat_id, [item],
+                                   context_token=self.client.context_token(chat_id))
+            self._turn_counts[chat_id] = self._turn_counts.get(chat_id, 0) + 1
+            log.info("attachment (agent-uploaded) -> %s", _safe(chat_id))
+        except ilink.ILinkError as exc:
+            log.error("agent-uploaded attachment to %s failed: %s", _safe(chat_id), exc)
 
     def _send_media_path(self, chat_id: str, path: Path) -> None:
         """Upload one local file to WeChat's CDN and send it as an attachment."""
@@ -715,8 +749,12 @@ class Gateway:
                                 bind.name, source[:24])
                     continue
             else:
-                log.warning("virtual: %s sent media this gateway cannot read (%s)",
-                            bind.name, source[:48])
+                # The agent asked us for the real upload parameters and POSTed the
+                # ciphertext to the CDN itself (a direct iLink client does exactly
+                # this), so the item is already sendable — forward it untouched.
+                log.info("virtual: %s -> wechat %s attachment (agent-uploaded)",
+                         bind.name, _safe(peer))
+                self._send_media_item(peer, item)
                 continue
             if not path.is_file():
                 log.warning("virtual: %s pointed at a missing file %s", bind.name, path)

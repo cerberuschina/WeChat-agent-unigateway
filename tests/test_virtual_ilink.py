@@ -353,6 +353,8 @@ class WiringTests(unittest.TestCase):
         try:
             gateway._start_virtual()
             self.assertIsNotNone(gateway.virtual)
+            self.assertTrue(callable(gateway.virtual.on_get_upload_url),
+                            "上传参数要能从真 iLink 借，否则 agent 发不了文件")
             bind = gateway.virtual.bind_named("claude")
             self.assertIsNotNone(bind, "auto_approve 应当直接放行")
 
@@ -561,6 +563,61 @@ class RemoteAgentTests(unittest.TestCase):
         outside.write_bytes(b"nope")
         self.assertIsNone(self.server.read_media("../secret.txt"))
         self.assertIsNone(self.server.read_media("peer/../../secret.txt"))
+
+
+class UploadUrlRelayTests(unittest.TestCase):
+    """getuploadurl：agent 自己加密上传，网关只借真身份替它要一次参数。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.asked = []
+        self.server = VirtualILinkServer(data_dir=Path(self._tmp.name), port=0,
+                                         on_get_upload_url=self._relay)
+        self.host, self.port = self.server.start()
+        self.base = "http://%s:%s" % (self.host, self.port)
+        qr = get("%s/ilink/bot/get_bot_qrcode?bot_type=3" % self.base)
+        post("%s/admin/approve" % self.base, {"qrcode": qr["qrcode"], "name": "hermes"})
+        status = get("%s/ilink/bot/get_qrcode_status?qrcode=%s" % (self.base, qr["qrcode"]))
+        self.token = status["bot_token"]
+
+    def tearDown(self):
+        self.server.stop()
+        self._tmp.cleanup()
+
+    def _relay(self, bind, payload):
+        self.asked.append((bind.name, payload))
+        return {"ret": 0, "upload_param": "PARAM-for-%s" % payload.get("filekey"),
+                "upload_full_url": ""}
+
+    def test_the_agents_payload_reaches_the_real_relay_and_the_answer_comes_back(self):
+        payload = {"filekey": "fk-1", "media_type": 3, "to_user_id": "wx-user",
+                   "rawsize": 42, "rawfilemd5": "d41d8cd98f00b204e9800998ecf8427e",
+                   "filesize": 48, "aeskey": "0f" * 16}
+        result = post("%s/ilink/bot/getuploadurl" % self.base, payload, token=self.token)
+        self.assertEqual(result["ret"], 0)
+        self.assertEqual(result["upload_param"], "PARAM-for-fk-1")
+        self.assertEqual(self.asked[0][0], "hermes")
+        self.assertEqual(self.asked[0][1]["filekey"], "fk-1",
+                         "payload 要原样转给真 iLink，否则算出来的参数对不上密文")
+
+    def test_an_unauthenticated_ask_never_reaches_the_real_identity(self):
+        result = post("%s/ilink/bot/getuploadurl" % self.base, {"filekey": "fk-2"})
+        self.assertEqual(result["ret"], -14)
+        self.assertEqual(self.asked, [], "没身份的请求不能借用真 token")
+
+    def test_without_a_relay_the_agent_is_told_plainly(self):
+        self.server.on_get_upload_url = None
+        result = post("%s/ilink/bot/getuploadurl" % self.base, {"filekey": "fk-3"}, token=self.token)
+        self.assertNotEqual(result["ret"], 0)
+        self.assertIn("not supported", result["errmsg"])
+
+    def test_a_failing_relay_becomes_an_error_not_a_crash(self):
+        def broken(_bind, _payload):
+            raise RuntimeError("iLink 掉线了")
+        self.server.on_get_upload_url = broken
+        result = post("%s/ilink/bot/getuploadurl" % self.base, {"filekey": "fk-4"}, token=self.token)
+        self.assertNotEqual(result["ret"], 0)
+        self.assertIn("getuploadurl failed", result["errmsg"])
 
 
 class PortCollisionTests(unittest.TestCase):

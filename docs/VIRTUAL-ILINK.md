@@ -215,6 +215,7 @@ python clients/ilink_agent_client.py --name claude \
 |---|---|
 | 微信 → agent | 网关下载解密到 `data/media/<联系人>/`，把「[文件] 名字（N 字节）+ 本地路径」当普通文本交给 agent——所以**任何**后端（CLI/A2A/虚拟）都能用，不必懂媒体协议 |
 | agent → 微信 | agent 的输出里写一行 `##FILE:<绝对路径>` / `##IMAGE:<路径>`，客户端把它摘出来、以 `localpath:` 标记交给网关；网关自己读文件、加密、上传、发出 |
+| agent → 微信（真 iLink 客户端） | 已连 iLink 的 agent（Hermes 的 weixin 通道）自己走完整链路：它调 `/ilink/bot/getuploadurl`，网关**用真 token 代问一次并原样回答案**（`upload_param` / `upload_full_url`），agent 自己 AES 加密、自己 POST 到 CDN，再把 `file_item` 交给网关；网关认出这不是 `localpath:`/`blob:` 标记，**原样转发**给真 iLink（不重复上传） |
 
 要点：
 
@@ -223,6 +224,8 @@ python clients/ilink_agent_client.py --name claude \
   装了 `cryptography` 就自动改用库实现。
 - **`aes_key` 的坑**：iLink 要的是 base64(**hex 字符串**)，不是 base64(原始字节)——弄错的话图片会变成灰块。
 - 附件也占每轮的 10 条额度；额度用完不会硬发，而是留一句说明（文件仍在磁盘上）。
+- **谁上传取决于 agent 会不会**：CLI/A2A 这类不懂媒体协议的 agent 只递路径（`localpath:`），网关替它上传；本来就讲 iLink 的 agent 自己上传，网关只借它真身份回答 `getuploadurl`——两条路都汇到同一个 `send_items`。
+- `ret=-2 / prepare failed` 是 iLink 的**频率限制**（见 `docs/PROTOCOL.md` 错误码表），不是协议写错了：文本刚发成功、紧接着发附件也很可能被拒，等冷却（分钟级）再试。
 
 ## 现在不支持 / 会明确报错的地方
 

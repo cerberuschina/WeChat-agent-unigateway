@@ -32,6 +32,21 @@ def cdn_base(client: Any) -> str:
     return str(getattr(client, "cdn_base_url", "") or CDN_BASE_URL).rstrip("/")
 
 
+def request_upload_url(client: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Ask the real iLink where to upload, and hand the answer straight back.
+
+    A *virtual* agent encrypts and POSTs the bytes to the CDN itself, so the only
+    thing it needs from the gateway is the same JSON a direct connection would
+    have gotten (``upload_param`` / ``upload_full_url``) — the payload is passed
+    through untouched, since the caller already filled in filekey/media_type/
+    rawsize/aeskey and the answer echoes the parameters for *its* upload.
+    """
+    return ilink._raise_for_status(
+        ilink._request("POST", client.base_url, EP_GET_UPLOAD_URL, token=client.token,
+                       payload=payload, timeout_ms=ilink.API_TIMEOUT_MS),
+        "getuploadurl")
+
+
 def _http_bytes(method: str, url: str, *, data: Optional[bytes] = None,
                 headers: Optional[Dict[str, str]] = None,
                 timeout: float = 60.0) -> Tuple[int, Dict[str, str], bytes]:
@@ -54,14 +69,10 @@ def _http_bytes(method: str, url: str, *, data: Optional[bytes] = None,
 def upload_media(client: Any, to: str, path: str | Path) -> Dict[str, Any]:
     """Encrypt a local file, push it to the CDN, return the ready-to-send item."""
     plan = media.file_upload_plan(path)
-    response = ilink._raise_for_status(
-        ilink._request("POST", client.base_url, EP_GET_UPLOAD_URL, token=client.token,
-                       payload={"filekey": plan["filekey"], "media_type": plan["media_type"],
-                                "to_user_id": to, "rawsize": plan["rawsize"],
-                                "rawfilemd5": plan["rawfilemd5"], "filesize": plan["filesize"],
-                                "no_need_thumb": True, "aeskey": plan["key"].hex()},
-                       timeout_ms=ilink.API_TIMEOUT_MS),
-        "getuploadurl")
+    response = request_upload_url(client, {"filekey": plan["filekey"], "media_type": plan["media_type"],
+                                           "to_user_id": to, "rawsize": plan["rawsize"],
+                                           "rawfilemd5": plan["rawfilemd5"], "filesize": plan["filesize"],
+                                           "no_need_thumb": True, "aeskey": plan["key"].hex()})
 
     upload_param = str(response.get("upload_param") or "")
     upload_url = str(response.get("upload_full_url") or "")
