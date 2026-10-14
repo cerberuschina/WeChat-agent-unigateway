@@ -13,12 +13,33 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+# One writer at a time: the write+replace pair below is what lets a reader see either the
+# old or the new file, never a half-written one.
+_WRITE_LOCK = threading.Lock()
+
 
 def _atomic_write(path: Path, payload: Any) -> None:
+    """Write JSON so a reader never sees a half-written file.
+
+    The temp name must be unique per call: with a shared ``<name>.tmp`` the concurrent
+    writers in this process (the virtual iLink persists from several request threads)
+    race over one file, and on Windows the loser's ``os.replace`` fails with
+    ``WinError 32`` / ``Errno 13`` — the write is dropped and nobody notices. The lock
+    additionally keeps the write+replace pair from interleaving with another replace of
+    the same target.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    with _WRITE_LOCK:
+        tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
 
 
 def _read_json(path: Path, default: Any) -> Any:

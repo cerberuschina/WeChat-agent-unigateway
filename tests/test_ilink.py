@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import socketserver
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
-from agent_gateway import ilink
+from agent_gateway import ilink, store
 
 
 class MessageParsingTests(unittest.TestCase):
@@ -130,6 +132,63 @@ class ClientPersistenceTests(unittest.TestCase):
         client.remember_context_token("u9", "ctx-9")
         saved = json.loads((self.dir / "context-tokens.json").read_text(encoding="utf-8"))
         self.assertEqual(saved, {"u9": "ctx-9"})
+
+
+class DroppedConnectionTests(unittest.TestCase):
+    """A peer that drops the long poll without answering must surface as ``ILinkError``.
+
+    ``http.client.RemoteDisconnected`` is what the real iLink server raises when it
+    recycles an idle poll. It used to travel out of the poll loop and exit the gateway
+    process, so the wrapper has to catch it and let the caller retry.
+    """
+
+    def test_a_poll_dropped_without_a_response_raises_ilink_error(self):
+        class _Silent(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.close()
+
+        server = socketserver.TCPServer(("127.0.0.1", 0), _Silent)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            with self.assertRaises(ilink.ILinkError) as caught:
+                ilink._request("POST", base_url, "getupdates",
+                               token="tok", payload={"get_updates_buf": ""})
+            self.assertIn("network error", str(caught.exception))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class AtomicWriteTests(unittest.TestCase):
+    """Concurrent state writes must not lose one another.
+
+    ``_atomic_write`` used one shared ``<name>.tmp`` for every writer, so two threads
+    raced over it and the loser's ``os.replace`` died with WinError 32 / Errno 13 — a
+    bind could drop off disk with nothing but a traceback in the log.
+    """
+
+    def test_concurrent_writes_leave_one_intact_file_and_no_temp_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "binds.json"
+            errors: list[BaseException] = []
+
+            def hammer(worker: int) -> None:
+                try:
+                    for size in range(1, 26):
+                        store._atomic_write(target, {"binds": [worker] * size})
+                except BaseException as exc:  # noqa: BLE001 - asserted below
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=hammer, args=(worker,)) for worker in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            self.assertIsInstance(json.loads(target.read_text(encoding="utf-8"))["binds"], list)
+            self.assertEqual(list(Path(tmp).glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

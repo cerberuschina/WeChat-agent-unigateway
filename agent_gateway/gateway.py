@@ -434,6 +434,13 @@ class Gateway:
                 log.warning("getupdates failed (%d): %s", failures, exc)
                 time.sleep(min(30, 2 ** min(failures, 5)))
                 continue
+            except OSError as exc:
+                # Last line of defence: one socket/OS error must never take the whole
+                # gateway down mid-poll (a single RemoteDisconnected used to exit it).
+                failures += 1
+                log.warning("getupdates OS error (%d): %s", failures, exc)
+                time.sleep(min(30, 2 ** min(failures, 5)))
+                continue
             failures = 0
             new_cursor = str(response.get("get_updates_buf") or "")
             if new_cursor and new_cursor != cursor:

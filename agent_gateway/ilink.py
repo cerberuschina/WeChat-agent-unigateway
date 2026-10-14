@@ -21,6 +21,7 @@ Wire notes (all verified against a working adapter, 2026-10):
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import secrets
@@ -169,7 +170,12 @@ def _request(method: str, base_url: str, endpoint: str, *, token: Optional[str] 
     except urllib.error.HTTPError as exc:  # pragma: no cover - network path
         raw = exc.read().decode("utf-8", "replace") if exc.fp else ""
         raise ILinkError(f"HTTP {exc.code} on {endpoint}: {raw[:200]}") from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except (urllib.error.URLError, TimeoutError, ConnectionError,
+            http.client.HTTPException) as exc:
+        # ConnectionError covers RemoteDisconnected / ConnectionResetError: the real iLink
+        # server drops an idle long poll without answering (and BadStatusLine is an
+        # HTTPException). An escaping one used to leave the poll loop and exit the whole
+        # gateway, so every caller must see ILinkError here and retry instead.
         raise ILinkError(f"network error on {endpoint}: {exc}") from exc
     try:
         data = json.loads(raw)
