@@ -322,8 +322,8 @@ class Gateway:
             self.store.set_sticky(sender, decision.set_sticky)
         # 用户又开口了 = 上一轮结束了：「本轮全放行」到此收回。
         # 回答放行卡的那几条不算新的一轮，否则 /always 一句话就把自己关掉了；
-        # /stop 同理——它是控制指令，不是新话题。
-        if decision.kind not in ("approve", "reject", "always", "stop"):
+        # /stop 同理——它是控制指令，不是新话题。保活 ping 也是通道噪声，不是新话题。
+        if decision.kind not in ("approve", "reject", "always", "stop", "keepalive"):
             self.approvals.clear_auto(sender)
         if decision.kind == "ignore":
             return
@@ -332,6 +332,10 @@ class Gateway:
                 self._send(sender, decision.text)
             else:
                 print(f"[dry-run] {suggestion_prefix(decision)} {decision.text}")
+            return
+
+        if decision.kind == "keepalive":
+            self._send_keepalive(sender)
             return
 
         if decision.kind in ("approve", "reject", "always"):
@@ -507,6 +511,17 @@ class Gateway:
     def _budget_left(self, chat_id: str) -> int:
         return max(0, max(1, int(self.cfg.delivery.max_messages_per_turn))
                    - self._turn_counts.get(chat_id, 0))
+
+    def _send_keepalive(self, chat_id: str) -> None:
+        """Answer a channel ping here and now — the model must never see it.
+
+        ``handle`` already opened a fresh budget for this message and this reply
+        spends one slot of it, so the text reports what is left *after* it.
+        """
+        left = max(0, self._budget_left(chat_id) - 1)
+        log.info("keepalive from %s: answered directly, %d slot(s) left this turn",
+                 _safe(chat_id), left)
+        self._send(chat_id, self.cfg.delivery.keepalive_template.format(n=left))
 
     def _get_upload_url(self, bind, payload: dict) -> dict:
         """Real upload parameters for a virtual agent that uploads by itself.

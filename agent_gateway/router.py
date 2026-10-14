@@ -9,6 +9,7 @@ Grammar (agents configure their own prefix, e.g. ``h`` / ``c`` / ``w``):
     /use claude                  -> sticky: this chat talks to claude from now on
     /approve k7  /reject k7      -> answer an agent's "may I?" (see approvals.py)
     /always                      -> allow every question left in this round
+    /ilink     (or 保活 alone)   -> channel keepalive: the gateway answers, no agent
     /who                         -> which agent is this chat talking to
     /agents                      -> the roster
     /help                        -> this text
@@ -18,18 +19,19 @@ Command names win over agent prefixes, so an agent cannot hijack ``/help``.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 COMMANDS = ("help", "agents", "who", "use", "ping", "approve", "reject", "always", "stop",
-            "queue")
+            "queue", "ilink")
 
 
 @dataclass
 class Decision:
     """What the gateway should do with one inbound message."""
 
-    kind: str                     # "reply" | "dispatch" | "ignore"
+    kind: str                     # "reply" | "dispatch" | "ignore" | "keepalive" | "approve" ...
     agent: str = ""               # dispatch target (agent name)
     text: str = ""                # payload for the agent, or the reply body
     note: str = ""                # free-form, for logs
@@ -39,6 +41,25 @@ class Decision:
 
 def _norm(text: str) -> str:
     return (text or "").strip()
+
+
+def _compact(text: str) -> str:
+    """Lowercase, drop spaces/punctuation: "iLink 保活！" and "ilink保活" are one shape."""
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", (text or "").lower())
+
+
+# Whole-message shapes only. A real request that merely contains the word ("保活完
+# 顺手看下盘口") must still reach the agent, so nothing longer matches.
+_KEEPALIVE_RE = re.compile(
+    r"^(?:保活|保活信息|保活消息|保活一下|心跳|"
+    r"ilink|ilink保活|ilink保活信息|ilink保活消息|ilink保活一下|保活ilink|"
+    r"keepalive|ilinkkeepalive|keepaliveping|ping)$"
+)
+
+
+def is_keepalive(text: str) -> bool:
+    """True when the message is nothing but a channel ping ("保活" / "ilink保活")."""
+    return bool(_KEEPALIVE_RE.match(_compact(text)))
 
 
 def roster_lines(cfg) -> List[str]:
@@ -63,6 +84,7 @@ def help_text(cfg, sticky: Optional[str]) -> str:
         "/always → 这一轮剩下的都别再问，全部放行",
         "/stop → 让正在跑的 agent 停下来（它几秒内会收到）",
         "/queue <内容> → 这条排在正在跑的活后面，不打断它",
+        "/ilink（或只发「保活」）→ 通道保活：网关自己回一句，不打扰 agent",
         "/agents 看名单　/who 看当前　/help 看这条",
         "",
         "名单：",
@@ -87,6 +109,14 @@ def route(text: str, cfg, *, sticky: Optional[str] = None) -> Decision:
             return Decision("reply", text="名单：\n" + "\n".join(roster_lines(cfg)), note="agents")
         if name == "ping":
             return Decision("reply", text="网关在。", note="ping")
+        if name in ("ilink", "keepalive"):
+            # /ilink 只为保活存在（网关自己回，agent 看不到）。带了别的内容就明说，
+            # 免得一条真活儿被静默吞掉。
+            if rest.strip() and not is_keepalive(rest):
+                return Decision("reply",
+                                text="/ilink 只是给通道保活用的。要干活就直接说，别加 /ilink。",
+                                note="ilink-usage")
+            return Decision("keepalive", note="keepalive")
         if name == "who":
             current = cfg.agent(sticky) or cfg.fallback_agent()
             return Decision("reply",
@@ -144,6 +174,9 @@ def route(text: str, cfg, *, sticky: Optional[str] = None) -> Decision:
             return Decision("dispatch", agent=agent.name, text=payload, note=f"prefix:{agent.prefix}")
 
         return Decision("reply", text=f"不认识这个命令：/{name}（/help 看用法）", note="unknown-command")
+
+    if is_keepalive(raw):
+        return Decision("keepalive", note="keepalive")
 
     agent = cfg.agent(sticky) or cfg.fallback_agent()
     if not agent:

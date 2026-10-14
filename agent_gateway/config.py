@@ -110,6 +110,9 @@ class DeliveryConfig:
     ack_template: str = "已转给 {label}，算完就回。"
     error_template: str = "「{label}」这次没跑通：{error}"
     queue_template: str = "队列里还有 {n} 条，按顺序回。"
+    # A "保活" ping is answered by the gateway itself — no agent, no model round
+    # trip. ``{n}`` is what stays in this turn's budget *after* this reply.
+    keepalive_template: str = "已重置ilink限制数，除掉本条消息，当前剩余{n}条信息余量"
     # How long an agent's "may I?" stays open on the phone. Silence expires to
     # *deny* — an unanswered question must never turn into permission. 180s proved
     # too short in practice: cards died while the phone was in a pocket, the agent

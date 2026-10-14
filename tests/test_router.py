@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from agent_gateway.config import ConfigError, load_config
-from agent_gateway.router import help_text, route
+from agent_gateway.router import help_text, is_keepalive, route
 
 
 def make_cfg(tmp: Path, agents=None, **over):
@@ -146,6 +146,43 @@ class ConfigTests(unittest.TestCase):
     def test_exec_requires_a_command(self):
         with self.assertRaises(ConfigError):
             make_cfg(self.tmp, agents={"a": {"type": "exec"}})
+
+
+class KeepaliveTests(unittest.TestCase):
+    """保活 ping 由网关自己回，模型看不到 —— 只有"整条消息就是 ping"才算。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.cfg = make_cfg(self.tmp)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_keepalive_shapes_are_recognised(self):
+        for text in ("保活", "ilink保活", "iLink 保活！", "保活信息", "保活一下", "保活消息",
+                     "/ilink", "/ilink 保活", "／ilink", "心跳", "keepalive", "ping"):
+            with self.subTest(text=text):
+                self.assertEqual(route(text, self.cfg).kind, "keepalive", text)
+
+    def test_a_real_request_that_contains_the_word_still_reaches_the_agent(self):
+        for text in ("保活完顺手看下盘口", "帮我把保活脚本改一下", "在吗，顺便看下大盘"):
+            with self.subTest(text=text):
+                self.assertEqual(route(text, self.cfg).kind, "dispatch", text)
+
+    def test_ilink_carrying_real_content_answers_usage_instead_of_swallowing_it(self):
+        d = route("/ilink 帮我查下天气", self.cfg)
+        self.assertEqual(d.kind, "reply")
+        self.assertIn("/ilink", d.text)
+
+    def test_keepalive_never_lands_on_another_agents_prefix(self):
+        # "ping" 这类词不能因为像前缀就被发去某个 agent
+        self.assertTrue(is_keepalive(" 保活 "))
+        self.assertFalse(is_keepalive("保活一下再看"))
+        self.assertFalse(is_keepalive(""))
+
+    def test_help_lists_the_ilink_keepalive(self):
+        self.assertIn("/ilink", help_text(self.cfg, None))
 
 
 if __name__ == "__main__":

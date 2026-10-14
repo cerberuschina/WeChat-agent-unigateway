@@ -91,6 +91,24 @@ class DryRunTests(unittest.TestCase):
         self.assertIn("Hermes", out)
         self.assertNotIn("收到", out)
 
+    def test_keepalive_is_answered_by_the_gateway_not_the_agent(self):
+        out = self.run_message("保活", mid="m-ka")
+        self.assertIn("已重置ilink限制数，除掉本条消息，当前剩余9条信息余量", out)
+        self.assertNotIn("收到", out)
+
+    def test_ilink_command_is_the_same_keepalive(self):
+        out = self.run_message("/ilink", mid="m-ilink")
+        self.assertIn("当前剩余9条信息余量", out)
+        self.assertNotIn("收到", out)
+
+    def test_keepalive_reports_what_is_left_after_itself(self):
+        # 上一轮没发完的内容会先补发、先占额度，保活报的是它之后还剩几条。
+        self.gateway._turn_counts["u1"] = 8
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.gateway._send_keepalive("u1")
+        self.assertIn("当前剩余1条信息余量", buffer.getvalue())
+
     def test_unauthorized_sender_is_ignored(self):
         cfg_path = self.tmp / "restricted.json"
         cfg_path.write_text(json.dumps({

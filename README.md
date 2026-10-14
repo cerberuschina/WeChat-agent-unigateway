@@ -118,6 +118,7 @@ python -m agent_gateway --config gateway.json
 | `/always` | 这一轮剩下的都别再问，全部放行 |
 | `/stop` | 让正在跑的 agent 停下来（它几秒内会收到） |
 | `/queue <内容>` | 这条排在正在跑的活后面，不打断它 |
+| `/ilink`（或只发 `保活` / `ilink保活`） | 通道保活：网关自己回一句，**不经过 agent**，并报本轮还剩几条额度 |
 | `/who` `/agents` `/help` | 看当前 / 看名单 / 看用法 |
 
 ## 配置
