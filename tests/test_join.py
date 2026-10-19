@@ -136,6 +136,38 @@ class BuildPlanTest(unittest.TestCase):
         self.assertFalse(plan.auto_approve)
         self.assertIn("virtual.accept_tokens.workbuddy", "\n".join(plan.changes(base_config())))
 
+    def test_workbuddy_join_rewrites_an_existing_per_user_binding(self):
+        """扫过码的机器上 claw.users.<uid> 压过 claw.channels——两层都得改，否则等于没改。"""
+        settings = self.world.workbuddy_home / "settings.json"
+        settings.write_text(json.dumps({
+            "claw": {
+                "channels": {"wechatmp": {"enabled": True}},
+                "users": {"u-1": {"channels": {"weixinClawBot": {
+                    "enabled": True,
+                    "botToken": {"$wbEncrypted": 1, "envelope": "enc"},
+                    "accountId": "2854f51f6393@im.bot",
+                    "channelId": {"$wbEncrypted": 1, "envelope": "enc-id"},
+                    "baseUrl": "https://ilinkai.weixin.qq.com",
+                }}}},
+            },
+        }, ensure_ascii=False), encoding="utf-8")
+        (self.world.data_dir).mkdir(parents=True, exist_ok=True)
+        (self.world.data_dir / "workbuddy-token.txt").write_text("virt-tok\n", encoding="utf-8")
+
+        plan = build_plan("workbuddy", self.world, Options())
+        lines = plan.client(plan, self.world, True)
+
+        raw = json.loads(settings.read_text(encoding="utf-8"))
+        global_channel = raw["claw"]["channels"]["weixinClawBot"]
+        user_channel = raw["claw"]["users"]["u-1"]["channels"]["weixinClawBot"]
+        for channel in (global_channel, user_channel):
+            self.assertEqual(channel["baseUrl"], plan.gateway_url)
+            self.assertEqual(channel["botToken"], "virt-tok")
+            self.assertEqual(channel["accountId"], "virt-workbuddy@im.bot")
+        # 渠道实例 id 不是我们该动的，必须原样留着
+        self.assertEqual(user_channel["channelId"], {"$wbEncrypted": 1, "envelope": "enc-id"})
+        self.assertIn("用户级绑定已改", "\n".join(lines))
+
     def test_claude_defaults_to_the_a2a_bridge(self):
         plan = build_plan("claude", self.world, Options())
         self.assertEqual(plan.entry["type"], "a2a")

@@ -252,7 +252,12 @@ def workbuddy_settings_path(world: World) -> Path:
 
 
 def _client_workbuddy(plan: Plan, world: World, apply: bool) -> List[str]:
-    """把虚拟凭证写进 WorkBuddy 的 claw 渠道配置（``claw.channels.weixinClawBot``）。
+    """把虚拟凭证写进 WorkBuddy 的 claw 渠道配置（``claw.channels`` + 每个用户的绑定）。
+
+    两层都得写：``claw.channels`` 是渠道定义，``claw.users.<uid>.channels`` 是每个用户
+    自己的绑定。机器上已经扫过码时后者存在且**优先级更高**——只写前者等于没改（实测：
+    写入后重启 WorkBuddy，它照旧连腾讯）。所以存在用户级绑定时逐个改 baseUrl /
+    botToken / accountId，``channelId``（不透明的渠道实例 id）原样留着。
 
     实测（5.6.2）：它自己的取码 URL 写死在 ``ilinkai.weixin.qq.com``，改不了；但渠道
     配置里的 ``baseUrl`` 会被 ``resolveAccount`` 读到，之后所有收发都走它 —— 所以给它
@@ -274,13 +279,25 @@ def _client_workbuddy(plan: Plan, world: World, apply: bool) -> List[str]:
         "channelId": account,
         "baseUrl": plan.gateway_url or "",
     }
-    if not apply:
-        return lines + [f"  · 会写入 baseUrl={config['baseUrl']}、botToken=***{_mask(token)[-4:]}"]
     raw = _read_json(path) if path.exists() else {}
+    # 扫过码的机器上存在用户级绑定，它加载时优先于 claw.channels
+    user_binds = [uid for uid, user in ((raw.get("claw") or {}).get("users") or {}).items()
+                  if isinstance(user, dict)
+                  and isinstance((user.get("channels") or {}).get("weixinClawBot"), dict)]
+    if not apply:
+        extra = (f"；另有 {len(user_binds)} 个用户级绑定会一并改" if user_binds else "")
+        return lines + [f"  · 会写入 baseUrl={config['baseUrl']}、botToken=***{_mask(token)[-4:]}{extra}"]
     claw = raw.setdefault("claw", {})
     claw.setdefault("channels", {})["weixinClawBot"] = config
+    for uid in user_binds:
+        # 扫过码的机器上，这份覆盖全局定义；不改它 = 白改。
+        user_channel = claw["users"][uid]["channels"]["weixinClawBot"]
+        user_channel.update({"enabled": True, "baseUrl": config["baseUrl"],
+                             "botToken": token, "accountId": account})
     bak = _write_json(path, raw)
     lines.append(f"  · 已写（备份 {bak.name if bak else '无'}）")
+    if user_binds:
+        lines.append(f"  · 用户级绑定已改：{', '.join(uid[:8] for uid in user_binds)}")
     lines.append("  · 重启 WorkBuddy 后生效（微信助理 不用再扫码；" 
                  "若你后来又在界面上扫码，它会把这份配置覆盖回腾讯的绑定）")
     return lines
