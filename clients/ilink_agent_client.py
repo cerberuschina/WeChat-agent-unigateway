@@ -97,7 +97,8 @@ def _terminate(proc: subprocess.Popen) -> None:
     try:
         if os.name == "nt":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=30)
+                           capture_output=True, timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         else:
             proc.kill()
     except Exception:  # noqa: BLE001 - stopping is best effort, never fatal
@@ -125,7 +126,8 @@ def run_agent(argv: list[str], text: str, *, use_stdin: bool, timeout: float, cw
         stdin = None
     proc = subprocess.Popen(command, stdin=subprocess.PIPE if stdin is not None else None,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, encoding="utf-8", errors="replace", cwd=cwd or None)
+                            text=True, encoding="utf-8", errors="replace", cwd=cwd or None,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     watcher = None
     if stop is not None:

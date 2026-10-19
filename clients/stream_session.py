@@ -75,7 +75,8 @@ class ClaudeStreamSession:
         self._proc = subprocess.Popen(self.command, stdin=subprocess.PIPE,
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                       text=True, encoding="utf-8", errors="replace",
-                                      bufsize=1, cwd=self.cwd, env=self.env)
+                                      bufsize=1, cwd=self.cwd, env=self.env,
+                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.started_at = time.time()
         threading.Thread(target=self._read_stdout, name="session-out", daemon=True).start()
         threading.Thread(target=self._read_stderr, name="session-err", daemon=True).start()

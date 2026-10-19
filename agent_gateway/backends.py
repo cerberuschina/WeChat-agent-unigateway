@@ -156,6 +156,7 @@ def call_exec(agent, text: str) -> str:
             encoding="utf-8",
             errors="replace",
             timeout=agent.timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except FileNotFoundError as exc:
         raise BackendError(f"找不到命令 {agent.command[0]!r}（{exc}）") from exc
