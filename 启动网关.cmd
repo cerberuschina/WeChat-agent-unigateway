@@ -1,4 +1,6 @@
 @echo off
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 rem Double-click entry: run start_agent_stack.py from THIS folder (no drive letters, any machine).
 rem Optional args: --check / --gateway-only / --client-only / --claude-cwd D:/work
 rem This file is ASCII-only on purpose: cmd.exe decodes .cmd in the OEM codepage, and UTF-8

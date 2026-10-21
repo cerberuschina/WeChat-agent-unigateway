@@ -7,5 +7,7 @@
 Option Explicit
 Dim sh
 Set sh = CreateObject("WScript.Shell")
+sh.Environment("PROCESS")("PYTHONUTF8") = "1"
+sh.Environment("PROCESS")("PYTHONIOENCODING") = "utf-8"
 sh.CurrentDirectory = "E:\claudeWork\WeChat-agent-unigateway"
 sh.Run "cmd /c C:\Python314\python.exe -m agent_gateway --config gateway.json >> data\gateway.out.log 2>&1", 0, False

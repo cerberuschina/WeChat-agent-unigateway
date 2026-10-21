@@ -2,6 +2,8 @@
 REM Start agent-gateway on Windows (double-click or run from a terminal).
 REM First run: make sure gateway.json exists and you already ran: python login.py
 setlocal
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 cd /d "%~dp0"
 if not exist gateway.json (
   echo [x] gateway.json not found. Copy gateway.example.json to gateway.json and edit it.

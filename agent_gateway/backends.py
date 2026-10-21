@@ -64,6 +64,10 @@ def extract_a2a_reply(payload: Dict[str, Any]) -> str:
     result = payload.get("result") if "result" in payload else payload
     if not isinstance(result, dict):
         raise BackendError("A2A response has no result object")
+    # 本机 claude_a2a_server 把 Task 包在 result.task 里（A2A v1.0），
+    # 而多数 A2A peer 直接把 Task 放在 result 下。两种形状都要认。
+    if isinstance(result.get("task"), dict):
+        result = result["task"]
 
     chunks: List[str] = []
     for artifact in result.get("artifacts") or []:

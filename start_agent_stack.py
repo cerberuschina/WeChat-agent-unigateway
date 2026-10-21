@@ -264,8 +264,13 @@ def start_gateway(cfg: dict) -> bool:
     with open(out, "a", encoding="utf-8") as log:
         log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} start_agent_stack 启动网关 ===\n")
         log.flush()
+        env = dict(os.environ)
+        # Windows 默认用 GBK 打开 stdout/stderr 与子进程管道；网关/A2A 链路全是 UTF-8，
+        # 不显式打开 UTF-8 模式时，中文会在边界上被按 cp936 解码成乱码。
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
         subprocess.Popen([PY, "-m", "agent_gateway", "--config", CONFIG.name],
-                         cwd=str(REPO), stdout=log, stderr=subprocess.STDOUT, **_detached())
+                         cwd=str(REPO), env=env, stdout=log, stderr=subprocess.STDOUT, **_detached())
     for _ in range(30):
         time.sleep(2)
         alive, _state = gateway_alive(cfg)

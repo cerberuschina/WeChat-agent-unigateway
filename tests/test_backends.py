@@ -47,6 +47,13 @@ class A2AExtractionTests(unittest.TestCase):
                    "artifacts": [{"parts": [{"text": "裸任务对象"}]}]}
         self.assertEqual(extract_a2a_reply(payload), "裸任务对象")
 
+    def test_task_wrapped_in_result_is_unwrapped(self):
+        """本机 claude_a2a_server 的 v1.0 形状：JSON-RPC result 里再包一层 task。"""
+        payload = {"jsonrpc": "2.0", "id": "1", "result": {"task": {
+            "id": "t1", "status": {"state": "completed"},
+            "artifacts": [{"parts": [{"kind": "text", "text": "任务包装里的中文"}]}]}}}
+        self.assertEqual(extract_a2a_reply(payload), "任务包装里的中文")
+
 
 class ExecBackendTests(unittest.TestCase):
     def _agent(self, command, timeout=30.0):
