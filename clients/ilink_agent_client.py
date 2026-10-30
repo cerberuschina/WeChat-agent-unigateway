@@ -474,10 +474,19 @@ class PeerSession:
         while not self._stop.is_set():
             # 换会话只在手里没活时做：正在跑的那一轮照常收尾，别把它的答案吞掉。
             if self._reset_message is not None and not self.pending:
-                self._apply_reset()
+                try:
+                    self._apply_reset()
+                except Exception as exc:  # noqa: BLE001 - 这条线程不能死，也不能无限重试
+                    self._reset_message = None
+                    log(f"（换会话没做成：{exc}）")
                 continue
             if self._resume_message is not None and not self.pending:
-                self._apply_resume()
+                try:
+                    self._apply_resume()
+                except Exception as exc:  # noqa: BLE001
+                    self._resume_message = None
+                    self._resume_target = ""
+                    log(f"（切会话没做成：{exc}）")
                 continue
             item = None
             try:
@@ -842,13 +851,22 @@ def main(argv: list | None = None) -> int:
             command, argument = parse_session_command(text)
             if command:
                 # /new、/sessions、/resume：网关把命令原样送进来，真正管事的是这里。
-                handle_session_command(
-                    command, argument, sender=sender, message=message, client=client,
-                    sessions=sessions, sessions_path=sessions_path,
-                    peer_sessions=peer_sessions, cwd=args.cwd,
-                    session_mode=bool(session_command),
-                    runner_has_session=(not args.stdin
-                                        and SESSION_PLACEHOLDER in runner))
+                # 这条命令出什么岔子都不能把长轮询带走（客户端没人看着重启）。
+                try:
+                    handle_session_command(
+                        command, argument, sender=sender, message=message, client=client,
+                        sessions=sessions, sessions_path=sessions_path,
+                        peer_sessions=peer_sessions, cwd=args.cwd,
+                        session_mode=bool(session_command),
+                        runner_has_session=(not args.stdin
+                                            and SESSION_PLACEHOLDER in runner))
+                except Exception as exc:  # noqa: BLE001
+                    log(f"（会话命令 /{command} 没处理成：{exc}）")
+                    try:
+                        client.send_text(sender, f"（这条 /{command} 没处理成：{exc}）",
+                                         context_token=message.get("context_token"))
+                    except Exception:  # noqa: BLE001
+                        pass
                 continue
             if session_command:
                 # 长命会话模式：这条消息不在这里等 —— 交给那个联系人的线程，它才收得住
