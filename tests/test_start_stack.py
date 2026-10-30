@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -99,11 +100,11 @@ class EnvAndDiscoveryTests(unittest.TestCase):
 
 
 class HostAuthScrubTests(unittest.TestCase):
-    """从 Claude Code 桌面会话里启动时，别把「宿主代管认证」的标记带给 claude。"""
+    """从 Claude Code 桌面会话里启动时，别把「宿主托管认证/沙箱」的标记带给 claude。"""
 
     def test_a_plain_terminal_env_is_left_alone(self):
         env = {"ANTHROPIC_AUTH_TOKEN": "tok", "ANTHROPIC_BASE_URL": "https://gw"}
-        self.assertEqual(stack.scrub_host_auth(dict(env)), env)
+        self.assertEqual(stack.scrub_host_env(dict(env)), env)
 
     def test_desktop_markers_and_the_host_proxy_are_dropped(self):
         env = {
@@ -116,11 +117,18 @@ class HostAuthScrubTests(unittest.TestCase):
             "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721/claude-desktop",
             "PATH": "/usr/bin",
         }
-        cleaned = stack.scrub_host_auth(dict(env))
+        cleaned = stack.scrub_host_env(dict(env))
         for key in stack.HOST_AUTH_MARKERS:
             self.assertNotIn(key, cleaned)
         self.assertNotIn("ANTHROPIC_BASE_URL", cleaned)
         self.assertEqual(cleaned["PATH"], "/usr/bin")
+
+    def test_sandbox_forcing_markers_are_dropped_even_without_auth_markers(self):
+        """宿主把子进程关进沙箱的标记，不管有没有认证标记都要清（网关要完整能力）。"""
+        env = {"CLAUDE_CODE_FORCE_SANDBOX": "1", "CLAUDE_CODE_SANDBOXED": "1"}
+        cleaned = stack.scrub_host_env(dict(env))
+        for key in stack.HOST_SANDBOX_MARKERS:
+            self.assertNotIn(key, cleaned)
 
     def test_start_client_hands_the_scrubbed_env_to_the_client(self):
         captured = {}
@@ -133,6 +141,7 @@ class HostAuthScrubTests(unittest.TestCase):
 
         def fake_popen(cmd, **kwargs):
             captured["env"] = kwargs.get("env")
+            captured["cmd"] = cmd
             return FakeProc()
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -143,6 +152,14 @@ class HostAuthScrubTests(unittest.TestCase):
                 pid, why = stack.start_client({"data_dir": tmp}, Path("claude"), {}, Path(tmp))
         self.assertEqual((pid, why), (4321, ""))
         self.assertNotIn("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", captured["env"])
+
+    def test_the_session_command_bypasses_permissions_and_disables_the_sandbox(self):
+        command = stack._session_command(Path("claude"), {"data_dir": "data"})
+        parts = shlex.split(command)          # 客户端就是这样解析的
+        self.assertIn("--permission-mode", parts)
+        self.assertEqual(parts[parts.index("--permission-mode") + 1], "bypassPermissions")
+        settings = json.loads(parts[parts.index("--settings") + 1])
+        self.assertIs(settings["sandbox"]["enabled"], False)
 
 
 class ProcessTests(unittest.TestCase):

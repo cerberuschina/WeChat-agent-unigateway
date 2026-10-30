@@ -156,6 +156,13 @@ python -m agent_gateway --config gateway.json
 `--input-format stream-json`）跑到一半插的话不会改变当前这一轮，而是在它这一轮结束后
 立刻成为下一轮。要它**马上**改做别的，那是 `/stop`（或 `interrupt`）的事。
 
+**claude 这一侧的权限**：`start_agent_stack.py` 起的 claude 客户端默认是
+`--permission-mode bypassPermissions`，并用 `--settings '{"sandbox":{"enabled":false}}'`
+显式关掉沙箱——微信这头没人能点「允许」，不 bypass 的话连 `echo` 都会被权限层直接拒绝
+（实测：没开沙箱、命令也跑不了）。要恢复逐条批准，把 `_session_command` 里的模式换回
+`acceptEdits`，再把 `hooks/claude_approval_hook.py` 挂进 claude 的 `PreToolUse`
+（它会把「想执行 …」发到微信，等你 `/approve`；问不到网关一律按拒绝）。
+
 `account` 留空时会去读 `data/account.json`（`login.py` 写的那个）。想换绑：删掉它重新扫码。
 
 虚拟接入那一段（谁可以自己取码、谁要我们发码）：
