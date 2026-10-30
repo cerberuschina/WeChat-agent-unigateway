@@ -98,6 +98,53 @@ class EnvAndDiscoveryTests(unittest.TestCase):
             self.assertEqual(found, exe)
 
 
+class HostAuthScrubTests(unittest.TestCase):
+    """从 Claude Code 桌面会话里启动时，别把「宿主代管认证」的标记带给 claude。"""
+
+    def test_a_plain_terminal_env_is_left_alone(self):
+        env = {"ANTHROPIC_AUTH_TOKEN": "tok", "ANTHROPIC_BASE_URL": "https://gw"}
+        self.assertEqual(stack.scrub_host_auth(dict(env)), env)
+
+    def test_desktop_markers_and_the_host_proxy_are_dropped(self):
+        env = {
+            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "1",
+            "CLAUDE_CODE_HOST_AUTH_ENV_VAR": "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH": "1",
+            "CLAUDE_CODE_ENTRYPOINT": "claude-desktop-3p",
+            "CLAUDECODE": "1",
+            "CLAUDE_CODE_CHILD_SESSION": "1",
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721/claude-desktop",
+            "PATH": "/usr/bin",
+        }
+        cleaned = stack.scrub_host_auth(dict(env))
+        for key in stack.HOST_AUTH_MARKERS:
+            self.assertNotIn(key, cleaned)
+        self.assertNotIn("ANTHROPIC_BASE_URL", cleaned)
+        self.assertEqual(cleaned["PATH"], "/usr/bin")
+
+    def test_start_client_hands_the_scrubbed_env_to_the_client(self):
+        captured = {}
+
+        class FakeProc:
+            pid = 4321
+
+            def poll(self):
+                return None
+
+        def fake_popen(cmd, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return FakeProc()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "1"},
+                                 clear=False), \
+                    mock.patch("start_agent_stack.subprocess.Popen", side_effect=fake_popen), \
+                    mock.patch("start_agent_stack.time.sleep"):
+                pid, why = stack.start_client({"data_dir": tmp}, Path("claude"), {}, Path(tmp))
+        self.assertEqual((pid, why), (4321, ""))
+        self.assertNotIn("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", captured["env"])
+
+
 class ProcessTests(unittest.TestCase):
     def test_pid_alive_knows_itself(self):
         self.assertTrue(stack.pid_alive(os.getpid()))

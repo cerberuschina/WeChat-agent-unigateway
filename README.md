@@ -114,6 +114,9 @@ python -m agent_gateway --config gateway.json
 | `帮我看下这个报错` | 发给**当前** agent（默认 hermes） |
 | `/c 修一下那个测试` | 这一条只发给 claude（一次性，不改默认） |
 | `/use claude` | 这个会话以后都发给 claude |
+| `/new`（或 `/reset`） | 让当前 agent **开一个新会话**：网关把 `/new` 原样转给它，它自己清掉上下文再回你一句（带标题写 `/new 给这个会话起名`） |
+| `/sessions` | 看当前 agent **有哪些会话可以接着聊**（claude 客户端会列出这个工作目录下最近的会话：标题、时间、id 前 8 位，✅ 是现在这条） |
+| `/resume 3` | 切到 `/sessions` 里的第 3 条（也可以 `/resume <id 前 8 位>`）；正在跑的那一轮会照常收尾，下一条消息开始接上那个会话 |
 | `/approve k7` `/reject k7` | 放行 / 拒绝 agent 等你点头的事（编号可省 = 最新那张） |
 | `/always` | 这一轮剩下的都别再问，全部放行 |
 | `/stop` | 让正在跑的 agent 停下来（它几秒内会收到） |

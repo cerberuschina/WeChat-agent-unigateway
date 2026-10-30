@@ -7,6 +7,7 @@ covered by test_virtual_ilink.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -258,6 +259,231 @@ class BindKeyTests(unittest.TestCase):
             if real_env is not None:
                 os.environ["ILINK_BIND_KEY"] = real_env
         self.assertNotIn("key=", seen["endpoint"])
+
+
+class NewSessionCommandTests(unittest.TestCase):
+    """``/new`` 在 agent 这一侧的意思：换一条全新的会话（上下文不带了）。"""
+
+    def test_the_command_is_recognised(self):
+        for text in ("/new", " /new ", "/NEW", "/reset", "/Reset", "/new 给这个会话起个名",
+                     "／new"):
+            self.assertTrue(client.is_new_session_command(text), text)
+
+    def test_ordinary_text_is_not_a_command(self):
+        for text in ("/news", "new", "帮我 /new 一下那个会话", "", "   "):
+            self.assertFalse(client.is_new_session_command(text), repr(text))
+
+
+class SessionCommandParsingTests(unittest.TestCase):
+    def test_the_three_commands_and_their_arguments(self):
+        cases = {
+            "/new 起个名": ("new", "起个名"),
+            "/reset": ("new", ""),
+            "/sessions": ("sessions", ""),
+            "/sessions 2": ("sessions", "2"),
+            "/resume 3": ("resume", "3"),
+            "/RESUME a1b2c3d4": ("resume", "a1b2c3d4"),
+            "／resume 1": ("resume", "1"),
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(client.parse_session_command(text), expected)
+
+    def test_ordinary_text_is_not_a_session_command(self):
+        for text in ("resume 3", "/resumex", "/session", "/会话", "", "   ", "看下 /resume"):
+            with self.subTest(text=text):
+                self.assertEqual(client.parse_session_command(text), ("", ""))
+
+
+class SessionCatalogTests(unittest.TestCase):
+    """``/sessions`` 从 claude 的 transcript 目录里列，``/resume`` 按编号或 id 前缀切。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.cwd = self.root / "work" / "site"
+        self.cwd.mkdir(parents=True)
+        self._old_config = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = str(self.root / "claude-home")
+        self.directory = client.project_dir_for(self.cwd)
+        self.directory.mkdir(parents=True)
+
+    def tearDown(self):
+        if self._old_config is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = self._old_config
+
+    def write_session(self, session_id: str, title: str, mtime: float) -> Path:
+        path = self.directory / f"{session_id}.jsonl"
+        lines = [{"type": "user", "message": {"role": "user", "content": title}},
+                 {"type": "assistant", "message": {"role": "assistant",
+                                                   "content": [{"type": "text", "text": "好"}]}}]
+        path.write_text("\n".join(json.dumps(line, ensure_ascii=False) for line in lines),
+                        encoding="utf-8")
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def test_project_dir_name_follows_claude_slugging(self):
+        self.assertEqual(client.project_dir_for("E:\\traeWork\\all").name, "E--traeWork-all")
+
+    def test_sessions_are_listed_newest_first_with_a_title(self):
+        self.write_session("11111111-1111-1111-1111-111111111111", "旧的活", 1000.0)
+        self.write_session("22222222-2222-2222-2222-222222222222", "修那个空指针", 2000.0)
+        (self.directory / "not-a-session.jsonl").write_text("{}", encoding="utf-8")
+        rows = client.list_claude_sessions(self.cwd)
+        self.assertEqual([row.id[:4] for row in rows], ["2222", "1111"])
+        self.assertEqual(rows[0].title, "修那个空指针")
+
+    def test_a_summary_line_wins_over_the_first_user_message(self):
+        path = self.directory / "33333333-3333-3333-3333-333333333333.jsonl"
+        path.write_text("\n".join(json.dumps(obj, ensure_ascii=False) for obj in [
+            {"type": "summary", "summary": "排查登录问题"},
+            {"type": "user", "message": {"role": "user", "content": "你好"}},
+        ]), encoding="utf-8")
+        self.assertEqual(client.session_title(path), "排查登录问题")
+
+    def test_command_wrappers_are_not_titles(self):
+        path = self.directory / "44444444-4444-4444-4444-444444444444.jsonl"
+        path.write_text("\n".join(json.dumps(obj, ensure_ascii=False) for obj in [
+            {"type": "user", "message": {"role": "user",
+                                         "content": "<command-name>/clear</command-name>"}},
+            {"type": "user", "message": {"role": "user", "content": "真的问题在这"}},
+        ]), encoding="utf-8")
+        self.assertEqual(client.session_title(path), "真的问题在这")
+
+    def test_the_listing_numbers_sessions_and_marks_the_current_one(self):
+        self.write_session("22222222-2222-2222-2222-222222222222", "修那个空指针", 2000.0)
+        self.write_session("11111111-1111-1111-1111-111111111111", "旧的活", 1000.0)
+        rows = client.list_claude_sessions(self.cwd)
+        text = client.format_session_list(
+            rows, "11111111-1111-1111-1111-111111111111", now=2600.0)
+        self.assertIn("2. ✅ 旧的活", text)
+        self.assertIn("1. 修那个空指针", text)
+        self.assertIn("/resume", text)
+
+    def test_resume_by_number_uses_the_listing_we_showed(self):
+        ids = ["aaaaaaaa-1111-1111-1111-111111111111",
+               "bbbbbbbb-2222-2222-2222-222222222222"]
+        self.assertEqual(client.resolve_session("2", cwd=self.cwd, catalog_ids=ids), (ids[1], ""))
+        target, problem = client.resolve_session("3", cwd=self.cwd, catalog_ids=ids)
+        self.assertEqual(target, "")
+        self.assertIn("/sessions", problem)
+
+    def test_resume_by_id_prefix(self):
+        self.write_session("abcdef12-3456-7890-abcd-ef1234567890", "那个活", 1000.0)
+        self.assertEqual(client.resolve_session("abcdef12", cwd=self.cwd)[0],
+                         "abcdef12-3456-7890-abcd-ef1234567890")
+
+    def test_an_ambiguous_prefix_is_refused(self):
+        self.write_session("abcd1111-3456-7890-abcd-ef1234567890", "一号", 1000.0)
+        self.write_session("abcd2222-3456-7890-abcd-ef1234567890", "二号", 1001.0)
+        target, problem = client.resolve_session("abcd", cwd=self.cwd)
+        self.assertEqual(target, "")
+        self.assertIn("2 条", problem)
+
+    def test_a_bad_argument_gets_usage(self):
+        for query in ("", "abc", "会话"):
+            target, problem = client.resolve_session(query, cwd=self.cwd)
+            self.assertEqual(target, "")
+            self.assertTrue(problem)
+
+
+class _FakeSession:
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+class _FakeILink:
+    def __init__(self):
+        self.sent = []
+
+    def send_text(self, peer, text, context_token=None):
+        self.sent.append(text)
+
+
+class SessionSwitchTests(unittest.TestCase):
+    """``/resume`` 真的切：关掉当前进程、记下 id，下一条从那条会话接上。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.sessions_path = self.root / "client.sessions.json"
+        self.client = _FakeILink()
+
+    def make_peer(self, sessions: dict) -> "client.PeerSession":
+        return client.PeerSession("wx-user-1", [], cwd=str(self.root), env={}, idle=0,
+                                  client=self.client, sessions=sessions,
+                                  sessions_path=self.sessions_path)
+
+    def test_resume_records_the_target_and_closes_the_live_session(self):
+        sessions = {"wx-user-1": "old-id"}
+        peer = self.make_peer(sessions)
+        live = _FakeSession("old-id")
+        peer.session = live
+        peer._resume_target = "new-target-id"
+        peer._resume_message = {}
+        peer._apply_resume()
+
+        self.assertTrue(live.stopped)
+        self.assertEqual(sessions["wx-user-1"], "new-target-id")
+        self.assertEqual(client.load_sessions(self.sessions_path)["wx-user-1"], "new-target-id")
+        self.assertIn("切到", self.client.sent[-1])
+        self.assertIn("new-targ", self.client.sent[-1])
+
+    def test_resuming_the_live_session_is_a_no_op(self):
+        sessions = {"wx-user-1": "live-id"}
+        peer = self.make_peer(sessions)
+        live = _FakeSession("live-id")
+        peer.session = live
+        peer._resume_target = "live-id"
+        peer._resume_message = {}
+        peer._apply_resume()
+
+        self.assertFalse(live.stopped)
+        self.assertEqual(sessions["wx-user-1"], "live-id")
+        self.assertIn("已经", self.client.sent[-1])
+
+    def test_handler_refuses_resume_without_a_resumable_configuration(self):
+        sent = []
+        fake = _FakeILink()
+        client.handle_session_command(
+            "resume", "1", sender="p", message={}, client=fake, sessions={},
+            sessions_path=self.sessions_path, peer_sessions={}, cwd=str(self.root),
+            session_mode=False, runner_has_session=False)
+        self.assertIn("{session}", fake.sent[-1])
+
+    def test_handler_sets_the_session_in_runner_mode(self):
+        fake = _FakeILink()
+        sessions = {}
+        client.handle_session_command(
+            "resume", "1", sender="p", message={}, client=fake, sessions=sessions,
+            sessions_path=self.sessions_path, peer_sessions={}, cwd=str(self.root),
+            session_mode=False, runner_has_session=False)  # 先确认被拒
+        cat = {"p": {"ids": ["99999999-9999-9999-9999-999999999999"]}}
+        client.save_catalog(client.catalog_path_for(self.sessions_path), cat)
+        client.handle_session_command(
+            "resume", "1", sender="p", message={}, client=fake, sessions=sessions,
+            sessions_path=self.sessions_path, peer_sessions={}, cwd=str(self.root),
+            session_mode=False, runner_has_session=True)
+        self.assertEqual(sessions["p"], "99999999-9999-9999-9999-999999999999")
+
+    def test_handler_lists_and_stores_the_catalog(self):
+        fake = _FakeILink()
+        client.handle_session_command(
+            "sessions", "", sender="p", message={}, client=fake, sessions={},
+            sessions_path=self.sessions_path, peer_sessions={}, cwd=str(self.root),
+            session_mode=True, runner_has_session=False)
+        self.assertTrue(fake.sent, "至少回一句")
+        catalog = client.load_catalog(client.catalog_path_for(self.sessions_path))
+        self.assertIn("p", catalog)
+        self.assertIsInstance(catalog["p"]["ids"], list)
 
 
 if __name__ == "__main__":

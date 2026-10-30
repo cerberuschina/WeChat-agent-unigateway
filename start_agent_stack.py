@@ -218,6 +218,54 @@ def find_creds(home: Path | None = None) -> tuple[dict, Path | None]:
     return {}, None
 
 
+# Claude Code 桌面版把它自己的会话环境注入到子进程里，其中这几项告诉 claude
+# 「认证由宿主代管」。claude 的孙进程（也就是这里起的 agent）不在宿主的请求里，
+# 宿主那个本地代理不会替它带 token，于是一开口就是「Not logged in」。
+HOST_AUTH_MARKERS = (
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
+    "CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH", "CLAUDE_CODE_HOST_SESSION_ID",
+    "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_ENTRYPOINT", "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_PID",
+)
+
+
+def scrub_host_auth(env: dict) -> dict:
+    """去掉桌面端注入的「宿主托管认证」标记，让 claude 子进程用本机自己的凭证。
+
+    只在真的看到宿主标记时才动；普通终端里的 ANTHROPIC_* 是用户自己的凭证，原样保留。
+    """
+    if not env.get("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"):
+        return env
+    for key in HOST_AUTH_MARKERS:
+        env.pop(key, None)
+    # 宿主把 ANTHROPIC_BASE_URL 指到自己的本地代理；离开宿主上下文，这个地址只会被拒。
+    env.pop("ANTHROPIC_BASE_URL", None)
+    return env
+
+
+def cli_login(home: Path | None = None) -> str:
+    """claude CLI 自己登录过（订阅/OAuth）时，不需要 ANTHROPIC_* 环境变量。
+
+    Claude Code 的登录状态放在 ``~/.claude.json`` 与 ``~/.claude``（或用
+    ``CLAUDE_CONFIG_DIR`` 指定的目录），这条路子根本不看 ``ANTHROPIC_AUTH_TOKEN``。
+    所以把它也算作\"有凭证\"，否则这台机器上明明能跑 claude，脚本却卡在凭证检查。
+    返回一句可打印的说明，没登录过就返回空串。
+    """
+    root = home or Path.home()
+    candidates: list[Path] = []
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        candidates.append(Path(config_dir))
+    candidates.append(root / ".claude")
+    for path in candidates:
+        if path.is_dir():
+            return f"claude CLI 已登录（{path}）"
+    for path in ([Path(config_dir) / ".claude.json"] if config_dir else []) + [root / ".claude.json"]:
+        if path.is_file():
+            return f"claude CLI 已登录（{path.name}）"
+    return ""
+
+
 def _version_key(path: Path) -> tuple:
     """按路径里的版本号排序：…/2.0.14/claude.exe 要比 …/2.0.9/ 新。"""
     for part in reversed(path.parts[:-1]):
@@ -304,7 +352,7 @@ def start_client(cfg: dict, exe: Path, creds: dict, cwd: Path) -> tuple[int | No
         token = token_file.read_text(encoding="utf-8").strip()
         if token:
             cmd += ["--reuse-token", token]     # 复用网关给的身份，省一次扫码
-    env = dict(os.environ)
+    env = scrub_host_auth(dict(os.environ))
     env.update({k: str(v) for k, v in creds.items()})
     env["CLAUDE_CODE_EXE"] = str(exe)
     out = ddir / "client-claude.log"
@@ -336,7 +384,10 @@ def _report(cfg: dict, cwd: Path, exe: Path | None, creds: dict, creds_src: Path
     elif creds:
         print("凭证        : 来自环境变量")
     else:
-        print("凭证        : ✗ 没有（设 ANTHROPIC_AUTH_TOKEN，或放 ~/.a2a-bridge/cc.env）")
+        login = cli_login()
+        print(f"凭证        : {login}" if login else
+              "凭证        : ✗ 没有（设 ANTHROPIC_AUTH_TOKEN，或放 ~/.a2a-bridge/cc.env，"
+              "或先跑一次 `claude` 登录）")
     print(f"客户端      : {f'已在跑 pid={cpid}（{cpid_src}）' if cpid else '没在跑'}")
     print(f"claude 目录 : {cwd}")
 
@@ -382,8 +433,8 @@ def main(argv=None) -> int:
             print(f"客户端已在跑（pid={cpid}，{cpid_src}），跳过启动")
         elif not exe:
             print("✗ 找不到 claude 可执行文件，跳过客户端启动")
-        elif not creds:
-            print("✗ 没有 ANTHROPIC 凭证，跳过客户端启动")
+        elif not creds and not cli_login():
+            print("✗ 没有 claude 凭证（没设 ANTHROPIC_*，claude CLI 也没登录过），跳过客户端启动")
         else:
             print(f"启动 claude 客户端（cwd={cwd}）…")
             pid, why = start_client(cfg, exe, creds, cwd)

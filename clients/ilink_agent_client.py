@@ -30,6 +30,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import shlex
 import subprocess
 import sys
@@ -46,6 +47,196 @@ from clients.stream_session import (ClaudeStreamSession, SessionDead,  # noqa: E
 PLACEHOLDER = "{text}"
 SESSION_PLACEHOLDER = "{session}"
 SESSION_MARK = "##SESSION:"
+
+# 整条消息只有这样才算换会话的命令（网关把它原样送进来，见 agent_gateway/gateway.py）。
+NEW_SESSION_WORDS = frozenset({"/new", "/reset"})
+LIST_SESSIONS_WORD = "/sessions"
+RESUME_SESSION_WORD = "/resume"
+
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def parse_session_command(text: str) -> tuple[str, str]:
+    """把会话类命令拆成 ``(命令, 参数)``；不是这类命令就返回 ``("", "")``。
+
+    命令只有整条消息的第一个词才算（和网关的规则一致），全角「／」也认。
+    """
+    parts = (text or "").strip().split(None, 1)
+    if not parts:
+        return "", ""
+    head = parts[0].lower().replace("／", "/")
+    argument = parts[1].strip() if len(parts) > 1 else ""
+    if head in NEW_SESSION_WORDS:
+        return "new", argument
+    if head == LIST_SESSIONS_WORD:
+        return "sessions", argument
+    if head == RESUME_SESSION_WORD:
+        return "resume", argument
+    return "", ""
+
+
+def is_new_session_command(text: str) -> bool:
+    """True when the message opens with ``/new`` (``/reset`` also works).
+
+    Trailing words are ignored here; Hermes uses them as the new session's title.
+    """
+    return parse_session_command(text)[0] == "new"
+
+
+# ---------------------------------------------------------------------- 会话目录
+# claude 把每个工作目录的 transcript 放在 ``~/.claude/projects/<目录名>/<会话 id>.jsonl``，
+# 目录名 = 工作目录路径里每个非字母数字字符都换成 ``-``（``E:\\traeWork\\all`` →
+# ``E--traeWork-all``）。``claude --resume <id>`` 认的就是这些 id。
+def claude_projects_root() -> Path:
+    configured = os.environ.get("CLAUDE_CONFIG_DIR") or ""
+    base = Path(configured) if configured else Path.home() / ".claude"
+    return base / "projects"
+
+
+def project_dir_for(cwd: str | Path) -> Path:
+    target = Path(cwd or Path.home()).expanduser().resolve()
+    return claude_projects_root() / re.sub(r"[^A-Za-z0-9]", "-", str(target))
+
+
+class KnownSession:
+    """一条能接着聊的会话：id、最近活动时间、第一句用户消息（当标题）。"""
+
+    def __init__(self, id: str, updated: float, title: str = ""):
+        self.id = id
+        self.updated = updated
+        self.title = title
+
+
+def _message_text(obj: dict) -> str:
+    content = (obj.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(str(block.get("text") or "") for block in content
+                        if isinstance(block, dict) and block.get("type") == "text")
+    return ""
+
+
+# 这些不是用户真说的话：命令包装、注入的系统提醒、被打断占位。
+_BORING_PREFIXES = ("<", "Caveat:", "[Request interrupted")
+
+
+def session_title(path: Path, max_lines: int = 400) -> str:
+    """从 transcript 里挑一句像样的话当标题（摘要行优先，否则第一句用户消息）。"""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for count, line in enumerate(handle):
+                if count >= max_lines:
+                    break
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("type") == "summary" and str(obj.get("summary") or "").strip():
+                    return " ".join(str(obj["summary"]).split())[:60]
+                if obj.get("type") != "user" or obj.get("isMeta") or obj.get("isSidechain"):
+                    continue
+                text = " ".join(_message_text(obj).split())
+                if not text or text.startswith(_BORING_PREFIXES):
+                    continue
+                return text[:60]
+    except OSError:
+        return ""
+    return ""
+
+
+def list_claude_sessions(cwd: str | Path, *, limit: int = 10,
+                         with_titles: bool = True) -> list[KnownSession]:
+    """这个工作目录下最近的会话，最新的排前面。"""
+    directory = project_dir_for(cwd)
+    if not directory.is_dir():
+        return []
+    found: list[tuple[float, Path]] = []
+    for path in directory.glob("*.jsonl"):
+        if not UUID_RE.match(path.stem):
+            continue                      # 子 agent 的旁支文件、别的碎片，不能 --resume
+        try:
+            found.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    found.sort(key=lambda pair: pair[0], reverse=True)
+    return [KnownSession(path.stem, updated, session_title(path) if with_titles else "")
+            for updated, path in found[:limit]]
+
+
+def _ago(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return "刚刚"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} 分钟前"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} 小时前"
+    return f"{int(seconds // 86400)} 天前"
+
+
+def format_session_list(rows: list[KnownSession], current_id: str = "",
+                        *, now: float | None = None) -> str:
+    if not rows:
+        return "这个工作目录还没有能接着聊的会话。直接说话就是一条新会话。"
+    now = now if now is not None else time.time()
+    lines = ["能接着聊的会话（最近的在前，✅ = 现在这条）："]
+    for index, row in enumerate(rows, 1):
+        mark = "✅ " if row.id == current_id else ""
+        when = time.strftime("%m-%d %H:%M", time.localtime(row.updated))
+        title = row.title or "（无标题）"
+        lines.append(f"{index}. {mark}{title} · {when}（{_ago(now - row.updated)}）· {row.id[:8]}")
+    lines += ["", "发 /resume 编号 切过去（也可以 /resume <id 前 8 位>）。"
+                  "/new 是开一条全新的，不断旧会话。"]
+    return "\n".join(lines)
+
+
+def resolve_session(query: str, *, cwd: str | Path,
+                    catalog_ids: list[str] | None = None) -> tuple[str, str]:
+    """``/resume`` 的参数 → 会话 id。编号按上一次 /sessions 给的那份列表算，稳定。"""
+    wanted = (query or "").strip()
+    if not wanted:
+        return "", ("用法：/resume <编号>（先发 /sessions 看列表），"
+                    "也可以直接给会话 id 的前几位。")
+    if wanted.isdigit():
+        index = int(wanted)
+        ids = list(catalog_ids or [])
+        if 1 <= index <= len(ids):
+            return ids[index - 1], ""
+        return "", f"没有第 {index} 条。先发 /sessions 看现在的列表。"
+    lowered = wanted.lower()
+    if not re.fullmatch(r"[0-9a-f-]{4,36}", lowered):
+        return "", "要编号（先发 /sessions），或会话 id 的前几位（十六进制和短横线）。"
+    matches = [row.id for row in list_claude_sessions(cwd, limit=500, with_titles=False)
+               if row.id.lower().startswith(lowered)]
+    if len(matches) == 1:
+        return matches[0], ""
+    if not matches:
+        return "", f"没找到 id 以 {wanted} 开头的会话。"
+    return "", f"{wanted} 能对上 {len(matches)} 条，多写几位。"
+
+
+def catalog_path_for(sessions_path: Path) -> Path:
+    """``/sessions`` 给过的列表（编号 → id）要落盘，下次 /resume 编号才对得上。"""
+    return sessions_path.with_name(sessions_path.stem + ".catalog.json")
+
+
+def load_catalog(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_catalog(path: Path, catalog: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def log(message: str) -> None:
@@ -196,11 +387,29 @@ class PeerSession:
         self.pending = 0
         self.started_at = 0.0
         self._stop = threading.Event()
+        # /new 的请求：不能在这里直接拆会话（session 只归 _run 那个线程碰），记下来等它收手。
+        self._reset_message: "dict | None" = None
+        # /resume 同理：切到一个已知会话，也要等手里这一轮跑完再动手。
+        self._resume_target = ""
+        self._resume_message: "dict | None" = None
         self._thread = threading.Thread(target=self._run, name=f"peer-{peer[-6:]}", daemon=True)
 
     # -- 外面只调这两个 --------------------------------------------------
     def submit(self, text: str, message: dict) -> None:
         self.queue.put((text, message))
+        if not self._thread.is_alive():
+            self._thread.start()
+
+    def reset(self, message: dict | None = None) -> None:
+        """换新会话：等手里这条跑完就关掉旧会话、忘掉它的 id。"""
+        self._reset_message = message or {}
+        if not self._thread.is_alive():
+            self._thread.start()
+
+    def resume(self, session_id: str, message: dict | None = None) -> None:
+        """切到已知会话：等手里这条跑完，关掉当前进程，下一条用 --resume 接上它。"""
+        self._resume_target = session_id
+        self._resume_message = message or {}
         if not self._thread.is_alive():
             self._thread.start()
 
@@ -233,8 +442,43 @@ class PeerSession:
         for path in media_paths:
             send_local_media(self.client, self.peer, path, message)
 
+    def _apply_reset(self) -> None:
+        """关掉旧会话、忘掉它的 id —— 下一条消息就是一个全新的上下文。"""
+        message = self._reset_message or {}
+        self._reset_message = None
+        self._close()
+        self.sessions.pop(self.peer, None)
+        save_sessions(self.sessions_path, self.sessions)
+        log(f"（{self.peer[-8:]} 换新会话：旧的关掉，下一条从零开始）")
+        self._reply("✅ 好，新会话，前面的上下文不带上了。", message)
+
+    def _apply_resume(self) -> None:
+        """切到已知会话：关掉当前进程，记下 id，下一条 _open 会 --resume 接上它。"""
+        target = self._resume_target
+        self._resume_target = ""
+        message = self._resume_message or {}
+        self._resume_message = None
+        live_id = self.session.session_id if self.session is not None else ""
+        if target and target == live_id:
+            self._reply("已经在这个会话里了，下一条就接着它。", message)
+            return
+        self._close()
+        self.sessions[self.peer] = target
+        save_sessions(self.sessions_path, self.sessions)
+        title = session_title(project_dir_for(self.cwd) / f"{target}.jsonl")
+        label = f"{title} · " if title else ""
+        log(f"（{self.peer[-8:]} 切到会话 {target[:8]}…，下一条 --resume 接上）")
+        self._reply(f"✅ 切到「{label}{target[:8]}…」，下一条接着那个会话聊。", message)
+
     def _run(self) -> None:
         while not self._stop.is_set():
+            # 换会话只在手里没活时做：正在跑的那一轮照常收尾，别把它的答案吞掉。
+            if self._reset_message is not None and not self.pending:
+                self._apply_reset()
+                continue
+            if self._resume_message is not None and not self.pending:
+                self._apply_resume()
+                continue
             item = None
             try:
                 item = self.queue.get(timeout=0.3)
@@ -403,6 +647,65 @@ def load_creds(path: Path) -> dict | None:
         return None
 
 
+def handle_session_command(command: str, argument: str, *, sender: str, message: dict,
+                           client, sessions: dict, sessions_path: Path, peer_sessions: dict,
+                           cwd: str, session_mode: bool, runner_has_session: bool) -> None:
+    """在客户端这一侧执行 /new、/sessions、/resume —— 会话只归这里管，网关只转交。
+
+    ``session_mode`` 是长命会话模式（--session-command）；``runner_has_session``
+    表示一条消息一个进程的模板里带 ``{session}``，能靠 --resume 接着上次的聊。
+    """
+
+    def reply(text: str) -> None:
+        client.send_text(sender, text, context_token=message.get("context_token"))
+
+    if command == "new":
+        # 长命会话模式交给那个联系人的线程（别在别的线程里拆它的 session）；
+        # runner 模式没有常驻会话，忘掉 session id 就够了。
+        worker = peer_sessions.get(sender)
+        if worker is not None:
+            worker.reset(message)
+        else:
+            sessions.pop(sender, None)
+            save_sessions(sessions_path, sessions)
+            log(f"（{sender[-8:]} 换新会话：忘掉 session id）")
+            reply("✅ 好，新会话，前面的上下文不带上了。")
+        return
+
+    if command == "sessions":
+        rows = list_claude_sessions(cwd)
+        catalog_path = catalog_path_for(sessions_path)
+        catalog = load_catalog(catalog_path)
+        # 编号只对这次给用户看的那份列表有效，所以把它存下来，/resume 编号才有据可依。
+        catalog[sender] = {"ids": [row.id for row in rows], "at": time.time()}
+        save_catalog(catalog_path, catalog)
+        reply(format_session_list(rows, sessions.get(sender, "")))
+        return
+
+    # /resume
+    if not session_mode and not runner_has_session:
+        reply("这个客户端一条消息起一个进程，模板里也没写 {session}，切会话用不上；"
+              "要能切，让 agent 用长命会话模式（--session-command），"
+              "或者 runner 模板里带上 {session}。")
+        return
+    catalog_ids = list((load_catalog(catalog_path_for(sessions_path)).get(sender) or {})
+                       .get("ids") or [])
+    target, problem = resolve_session(argument, cwd=cwd, catalog_ids=catalog_ids)
+    if not target:
+        reply(problem)
+        return
+    worker = peer_sessions.get(sender)
+    if worker is not None:
+        worker.resume(target, message)          # 它等这一轮跑完再关旧会话，别在这里抢
+        return
+    sessions[sender] = target
+    save_sessions(sessions_path, sessions)
+    title = session_title(project_dir_for(cwd) / f"{target}.jsonl")
+    label = f"{title} · " if title else ""
+    log(f"（{sender[-8:]} 切到会话 {target[:8]}…，下一条接上）")
+    reply(f"✅ 切到「{label}{target[:8]}…」，下一条接着那个会话聊。")
+
+
 def main(argv: list | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run an agent on WeChat via the virtual gateway")
     parser.add_argument("--name", default="agent", help="this agent's name (must match the gateway config)")
@@ -536,6 +839,17 @@ def main(argv: list | None = None) -> int:
             started = time.time()
             session = sessions.get(sender, "")
             export_approval_env(client, sender)   # 工具钩子靠这几个变量找回网关
+            command, argument = parse_session_command(text)
+            if command:
+                # /new、/sessions、/resume：网关把命令原样送进来，真正管事的是这里。
+                handle_session_command(
+                    command, argument, sender=sender, message=message, client=client,
+                    sessions=sessions, sessions_path=sessions_path,
+                    peer_sessions=peer_sessions, cwd=args.cwd,
+                    session_mode=bool(session_command),
+                    runner_has_session=(not args.stdin
+                                        and SESSION_PLACEHOLDER in runner))
+                continue
             if session_command:
                 # 长命会话模式：这条消息不在这里等 —— 交给那个联系人的线程，它才收得住
                 # "边跑边插"（在这里等的话，插话只能排在后面）。

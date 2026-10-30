@@ -116,6 +116,44 @@ class RouterTests(unittest.TestCase):
         d = route("／c 你好", self.cfg)
         self.assertEqual((d.kind, d.agent), ("dispatch", "claude"))
 
+    def test_new_asks_the_current_agent_for_a_fresh_session(self):
+        d = route("/new", self.cfg)
+        self.assertEqual((d.kind, d.agent), ("new", "hermes"))
+        self.assertEqual(d.text, "/new")
+
+    def test_new_follows_the_sticky_agent(self):
+        self.assertEqual(route("/new", self.cfg, sticky="claude").agent, "claude")
+
+    def test_new_keeps_a_title_argument(self):
+        """``/new 标题``：Hermes 拿后面那段当新会话的标题，别在半路吃掉。"""
+        self.assertEqual(route("/new 修那个 bug", self.cfg).text, "/new 修那个 bug")
+
+    def test_reset_is_the_same_command(self):
+        self.assertEqual(route("/reset", self.cfg).kind, "new")
+
+    def test_sessions_goes_to_the_current_agent(self):
+        d = route("/sessions", self.cfg)
+        self.assertEqual((d.kind, d.agent, d.text), ("sessions", "hermes", "/sessions"))
+        d = route("/sessions", self.cfg, sticky="claude")
+        self.assertEqual((d.kind, d.agent), ("sessions", "claude"))
+
+    def test_resume_keeps_its_argument(self):
+        d = route("/resume 3", self.cfg, sticky="claude")
+        self.assertEqual((d.kind, d.agent, d.text), ("resume", "claude", "/resume 3"))
+        self.assertEqual(route("/resume abc12345", self.cfg).text, "/resume abc12345")
+
+    def test_session_commands_are_normalised_from_fullwidth_slash(self):
+        self.assertEqual(route("／resume 2", self.cfg).text, "/resume 2")
+        self.assertEqual(route("／new 起个名", self.cfg).text, "/new 起个名")
+
+    def test_help_mentions_sessions(self):
+        text = help_text(self.cfg, None)
+        self.assertIn("/sessions", text)
+        self.assertIn("/resume", text)
+
+    def test_help_mentions_new(self):
+        self.assertIn("/new", help_text(self.cfg, None))
+
 
 class ConfigTests(unittest.TestCase):
     def setUp(self):

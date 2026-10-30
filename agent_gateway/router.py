@@ -7,6 +7,8 @@ Grammar (agents configure their own prefix, e.g. ``h`` / ``c`` / ``w``):
 
     /c fix the flaky test        -> one-shot: send to the agent whose prefix is c
     /use claude                  -> sticky: this chat talks to claude from now on
+    /new                         -> the chat's agent starts a fresh session
+    /sessions  /resume 3         -> the chat's agent lists / switches its sessions
     /approve k7  /reject k7      -> answer an agent's "may I?" (see approvals.py)
     /always                      -> allow every question left in this round
     /ilink     (or 保活 alone)   -> channel keepalive: the gateway answers, no agent
@@ -23,8 +25,8 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-COMMANDS = ("help", "agents", "who", "use", "ping", "approve", "reject", "always", "stop",
-            "queue", "ilink")
+COMMANDS = ("help", "agents", "who", "use", "new", "reset", "sessions", "resume", "ping",
+            "approve", "reject", "always", "stop", "queue", "ilink")
 
 
 @dataclass
@@ -80,6 +82,9 @@ def help_text(cfg, sticky: Optional[str]) -> str:
             lines.append(f"/{agent.prefix} 内容 → 这一条只发给「{agent.display}」")
     lines += [
         "/use <名字> → 这个会话以后都发给它",
+        "/new → 让当前 agent 开一个新会话（之前的上下文不再带上）",
+        "/sessions → 看当前 agent 有哪些会话可以接着聊",
+        "/resume <编号> → 切到其中一条，下一条消息接着那个会话",
         "/approve <编号> / /reject <编号> → 放行或拒绝 agent 等你点头的那件事",
         "/always → 这一轮剩下的都别再问，全部放行",
         "/stop → 让正在跑的 agent 停下来（它几秒内会收到）",
@@ -133,6 +138,19 @@ def route(text: str, cfg, *, sticky: Optional[str] = None) -> Decision:
                 return Decision("reply", text=f"没有这个 agent：{wanted}。有的是：{known}", note="use-unknown")
             return Decision("reply", text=f"好，这个会话以后发给「{agent.display}」。[{agent.name}]",
                             note="use", set_sticky=agent.name)
+
+        if name in ("new", "reset", "sessions", "resume"):
+            # 会话类命令——/new 换一条新的，/sessions 列出能接着聊的，/resume 切过去。
+            # 会话本体在 agent 自己那边（Hermes 的 gateway、claude 客户端的模块里），
+            # 网关碰不到它，所以只负责把命令原样送过去，由它自己答。
+            # 后面带的话（/new 标题、/resume 编号）一起送，别在半路吃掉。
+            # 全角的「／」在这里统一成半角，客户端只认 /new 这种写法。
+            current = cfg.agent(sticky) or cfg.fallback_agent()
+            if not current:
+                return Decision("reply", text="没有可用的 agent。", note="no-agent")
+            kind = "new" if name in ("new", "reset") else name
+            return Decision(kind, agent=current.name, text="/" + raw[1:],
+                            note=f"session-{name}")
 
         if name in ("approve", "yes", "ok", "reject", "no"):
             # Answering an agent's "may I?" — the gateway owns the pending list,

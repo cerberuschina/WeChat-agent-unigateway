@@ -346,6 +346,11 @@ class Gateway:
             self._request_stop(sender)
             return
 
+        if decision.kind in ("new", "sessions", "resume"):
+            self._forward_session_command(sender, decision, message_id=message_id,
+                                          context_token=context_token)
+            return
+
         agent = self.cfg.agent(decision.agent)
         if not agent:
             self._send(sender, f"路由到了一个不存在的 agent：{decision.agent}")
@@ -681,6 +686,46 @@ class Gateway:
             return
         log.info("approval %s -> asking %s", _safe(approval.id), _safe(peer))
         self._send(peer, self.approvals.describe(approval))
+
+    def _forward_session_command(self, sender: str, decision, *, message_id: str = "",
+                                 context_token: str = "") -> None:
+        """``/new`` ``/sessions`` ``/resume``: session commands belong to the agent.
+
+        The session itself lives inside the agent (Hermes' own gateway session, the
+        ``--resume`` id the claude client keeps), so the gateway cannot rotate or list
+        it and must not pretend to. What it can do is hand the command over unchanged:
+        the agent acts on it and answers with its own list/confirmation, which travels
+        back over the virtual iLink like any other reply.
+        """
+        agent = self.cfg.agent(decision.agent) or self.cfg.fallback_agent()
+        if not agent:
+            self._send(sender, "没有可用的 agent。")
+            return
+        text = (decision.text or f"/{decision.kind}").strip() or f"/{decision.kind}"
+        verb = {"new": "换", "sessions": "列", "resume": "切"}.get(decision.kind, "换")
+        if agent.type != "virtual":
+            # a2a/http/exec backends are called per message; there is no session the
+            # gateway owns, and inventing one here would be a lie.
+            self._send(sender, f"「{agent.display}」是按 {agent.type} 直连的后端，网关没法替它{verb}会话；"
+                               f"把它按虚拟 iLink 接进来（join.py / clients/ilink_agent_client.py）"
+                               f"就能用 /{decision.kind}。")
+            log.info("/%s refused for %s: backend type is %s", decision.kind, agent.name, agent.type)
+            return
+        if not self.virtual:
+            self._send(sender, f"「{agent.display}」是虚拟接入，但这个网关没开 virtual 模式，送不进去。")
+            return
+        delivered = self.virtual.deliver(agent.name, text=text, peer=sender,
+                                         message_id=message_id, context_token=context_token)
+        if not delivered:
+            self._send(sender, f"「{agent.display}」还没接入：让它在自己那边发起一次微信扫码登录，"
+                               f"然后在这里批准 → {self.virtual.base_url()}/admin/binds")
+            return
+        log.info("/%s -> %s from %s", decision.kind, agent.name, _safe(sender))
+        self._record("in", sender, agent.name, text)
+        # The agent answers with its own list/confirmation; hold 「正在输入」 briefly so
+        # the chat does not look dead in the second it takes (and never longer, in case
+        # a backend silently ignores the command).
+        self._start_typing(sender, max_seconds=120.0)
 
     def _request_stop(self, sender: str) -> None:
         """``/stop``: tell the agent that is working for this chat to drop it.
