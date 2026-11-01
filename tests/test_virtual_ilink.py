@@ -6,8 +6,10 @@ Covers both layers: the endpoint bodies (fast, direct) and the real HTTP surface
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.request
 from pathlib import Path
@@ -634,3 +636,48 @@ class PortCollisionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RebindTests(unittest.TestCase):
+    """A restart must bind its port at once; a second live gateway must still be refused."""
+
+    @staticmethod
+    def _server(port: int = 0):
+        from http.server import BaseHTTPRequestHandler
+        from agent_gateway.virtual_ilink import _make_server
+
+        class _Ok(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = _make_server("127.0.0.1", port, _Ok)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    @unittest.skipIf(os.name == "nt", "Windows keeps SO_REUSEADDR off on purpose")
+    def test_a_restart_binds_over_the_last_runs_time_wait_sockets(self):
+        first = self._server()
+        port = first.server_address[1]
+        # the server closes first, so the TIME_WAIT lands on the listening port
+        urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+            f"http://127.0.0.1:{port}/", timeout=5).read()
+        first.shutdown()
+        first.server_close()
+        second = self._server(port)
+        second.shutdown()
+        second.server_close()
+
+    def test_a_second_live_server_on_the_same_port_is_refused(self):
+        first = self._server()
+        try:
+            with self.assertRaises(OSError):
+                self._server(first.server_address[1])
+        finally:
+            first.shutdown()
+            first.server_close()

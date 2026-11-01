@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import urllib.parse
@@ -221,9 +222,10 @@ class TrafficRing:
 
 
 class _DashboardServer(ThreadingHTTPServer):
-    """Same reasoning as the virtual server: never share a port silently."""
+    """Same reasoning as the virtual server: never share a port silently, but let a
+    restart bind over TIME_WAIT where SO_REUSEADDR cannot hijack a live port."""
 
-    allow_reuse_address = False
+    allow_reuse_address = os.name != "nt"
 
 
 class Dashboard:
