@@ -41,6 +41,9 @@ class Decision:
     metadata: dict = field(default_factory=dict)
 
 
+COMMAND_PREFIXES = ("/", "／", "!")
+
+
 def _norm(text: str) -> str:
     return (text or "").strip()
 
@@ -98,13 +101,18 @@ def help_text(cfg, sticky: Optional[str]) -> str:
     return "\n".join(lines)
 
 
+def is_command(text: str) -> bool:
+    """True when ``route`` would read the message as a ``/command``."""
+    return _norm(text).startswith(COMMAND_PREFIXES)
+
+
 def route(text: str, cfg, *, sticky: Optional[str] = None) -> Decision:
     """Decide what to do with one inbound message."""
     raw = _norm(text)
     if not raw:
         return Decision("ignore", note="empty")
 
-    if raw.startswith(("/", "／", "!")):
+    if raw.startswith(COMMAND_PREFIXES):
         head, _, rest = raw[1:].partition(" ")
         name = head.strip().lower()
 

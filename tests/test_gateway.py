@@ -15,6 +15,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from unittest import mock
+
+from agent_gateway import gateway as gateway_module, ilink
 from agent_gateway.config import load_config
 from agent_gateway.gateway import Gateway
 
@@ -86,6 +89,29 @@ class DryRunTests(unittest.TestCase):
         second = self.run_message("重复的内容", mid="b")
         self.assertEqual(second.strip(), "")
 
+    def test_the_same_text_is_taken_again_once_the_short_window_passes(self):
+        self.run_message("继续", mid="c1")
+        for key in list(self.gateway.store._seen):
+            if key.startswith("text:"):
+                self.gateway.store._seen[key] -= gateway_module.CONTENT_DEDUP_SECONDS + 1
+        self.assertIn("HERMES 收到：继续", self.run_message("继续", mid="c2"))
+
+    def test_a_repeated_command_is_not_dropped_as_duplicate_content(self):
+        first = self.run_message("/agents", mid="ag1")
+        second = self.run_message("/agents", mid="ag2")
+        self.assertIn("Hermes", first)
+        self.assertIn("Hermes", second)
+
+    def test_a_replayed_command_with_the_same_id_is_still_dropped(self):
+        self.run_message("/agents", mid="ag-same")
+        self.assertEqual(self.run_message("/agents", mid="ag-same").strip(), "")
+
+    def test_a_second_keepalive_is_answered(self):
+        first = self.run_message("保活", mid="k1")
+        second = self.run_message("保活", mid="k2")
+        self.assertTrue(first.strip())
+        self.assertTrue(second.strip())
+
     def test_commands_are_answered_without_calling_an_agent(self):
         out = self.run_message("/agents", mid="m-agents")
         self.assertIn("Hermes", out)
@@ -152,6 +178,74 @@ class DryRunTests(unittest.TestCase):
             self.assertIn("没有我能读的内容", buffer.getvalue())
         finally:
             gateway.shutdown()
+
+
+class PollLoopTests(unittest.TestCase):
+    """``Gateway.run`` must act on what ``getupdates`` raises, not spin past it."""
+
+    setUp = DryRunTests.setUp
+    tearDown = DryRunTests.tearDown
+
+    def _run_with(self, client) -> int:
+        self.gateway._resolve_account = lambda: setattr(self.gateway, "client", client) or True
+        self.gateway._start_virtual = lambda: None
+        with contextlib.redirect_stderr(io.StringIO()):
+            return self.gateway.run()
+
+    def test_an_expired_session_exits_with_code_3(self):
+        class _Expired:
+            account_id, base_url = "bot@im.bot", "http://x"
+
+            def load_cursor(self):
+                return ""
+
+            def get_updates(self, cursor):
+                raise ilink.SessionExpired("getupdates: ret=-14", ret=-14)
+
+        self.assertEqual(self._run_with(_Expired()), 3)
+
+    def test_a_rate_limit_backs_off_before_polling_again(self):
+        gateway = self.gateway
+        sleeps = []
+
+        class _Throttled:
+            account_id, base_url = "bot@im.bot", "http://x"
+            calls = 0
+
+            def load_cursor(self):
+                return ""
+
+            def get_updates(self, cursor):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ilink.RateLimited("getupdates: ret=-2", ret=-2)
+                gateway._stop.set()
+                return {"ret": 0, "msgs": []}
+
+        with mock.patch.object(gateway_module.time, "sleep", sleeps.append):
+            self.assertEqual(self._run_with(_Throttled()), 0)
+        self.assertEqual(sleeps[0], gateway_module.RATE_LIMIT_BACKOFF_SECONDS)
+
+    def test_an_instant_empty_answer_is_not_polled_again_at_once(self):
+        gateway = self.gateway
+        sleeps = []
+
+        class _Instant:
+            account_id, base_url = "bot@im.bot", "http://x"
+            calls = 0
+
+            def load_cursor(self):
+                return ""
+
+            def get_updates(self, cursor):
+                self.calls += 1
+                if self.calls == 3:
+                    gateway._stop.set()
+                return {"ret": 0, "msgs": []}
+
+        with mock.patch.object(gateway_module.time, "sleep", sleeps.append):
+            self._run_with(_Instant())
+        self.assertEqual(sleeps, [gateway_module.MIN_EMPTY_POLL_SECONDS] * 3)
 
 
 class EntryPointTests(unittest.TestCase):
