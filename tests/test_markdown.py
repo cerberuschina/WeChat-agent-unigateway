@@ -26,6 +26,21 @@ class RenderTests(unittest.TestCase):
         out = md.render(src)
         self.assertEqual(out, "名称 ｜ 值\na ｜ 1\nb ｜ 2")
 
+    def test_inline_code_keeps_every_character(self):
+        self.assertEqual(md.render("改 `__init__.py` 和 `__main__`"), "改 __init__.py 和 __main__")
+        self.assertEqual(md.render("匹配 `*.py and *.js`"), "匹配 *.py and *.js")
+        self.assertEqual(md.render("写成 `[a](b)` 就行"), "写成 [a](b) 就行")
+        self.assertEqual(md.render("- 看 `**kwargs`"), "· 看 **kwargs")
+        self.assertEqual(md.render("``a`b``"), "a`b")
+
+    def test_a_bare_glob_is_not_read_as_italics(self):
+        self.assertEqual(md.render("*.py and *.js"), "*.py and *.js")
+        self.assertEqual(md.render("a ** b ** c"), "a ** b ** c")
+
+    def test_table_cells_get_inline_rendering_and_keep_empty_cells(self):
+        src = "| 名称 | 值 | 备注 |\n|---|---|---|\n| **x** | 1 | `a_b` |\n| a |  | c |"
+        self.assertEqual(md.render(src), "名称 ｜ 值 ｜ 备注\nx ｜ 1 ｜ a_b\na ｜  ｜ c")
+
     def test_links_keep_the_url(self):
         self.assertEqual(md.render("看 [文档](https://x.dev) 吧"), "看 文档 (https://x.dev) 吧")
 

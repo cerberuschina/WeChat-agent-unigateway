@@ -91,12 +91,14 @@ class StateStore:
     def fingerprint(*parts: str) -> str:
         return hashlib.sha1("\x1f".join(parts).encode("utf-8")).hexdigest()
 
-    def is_duplicate(self, key: str) -> bool:
-        """True when this key was seen inside the TTL window."""
+    def is_duplicate(self, key: str, *, ttl: Optional[float] = None) -> bool:
+        """True when this key was seen inside the TTL window (``ttl`` may only shorten it)."""
         now = time.time()
+        window = self._dedup_ttl if ttl is None else min(ttl, self._dedup_ttl)
         with self._lock:
             self._prune(now)
-            if key in self._seen:
+            seen = self._seen.get(key)
+            if seen is not None and now - seen <= window:
                 return True
             self._seen[key] = now
             # Persist sparingly: dedup is best-effort across restarts.

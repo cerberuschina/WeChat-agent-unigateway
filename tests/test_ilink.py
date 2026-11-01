@@ -1,7 +1,9 @@
 """iLink wire layer: parsing, error mapping, persistence. No network."""
 from __future__ import annotations
 
+import http.server
 import json
+import socket
 import socketserver
 import tempfile
 import threading
@@ -158,6 +160,91 @@ class DroppedConnectionTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class GetUpdatesTests(unittest.TestCase):
+    """``getupdates`` answers its errors with HTTP 200 and a ``ret`` code; those must
+    reach the poll loop instead of passing as an empty batch (a dead token used to
+    spin the gateway against the server forever)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _serve(self, handler_cls):
+        server = socketserver.TCPServer(("127.0.0.1", 0), handler_cls)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    def _answering(self, payload: dict) -> str:
+        body = json.dumps(payload).encode("utf-8")
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        return self._serve(_Handler)
+
+    def _client(self, base_url: str) -> ilink.ILinkClient:
+        return ilink.ILinkClient("bot@im.bot", "tok", base_url=base_url, data_dir=self.dir)
+
+    def test_an_expired_token_raises_session_expired(self):
+        client = self._client(self._answering({"ret": -14, "errmsg": "session timeout"}))
+        with self.assertRaises(ilink.SessionExpired):
+            client.get_updates("buf")
+
+    def test_a_rate_limit_raises_rate_limited(self):
+        client = self._client(self._answering({"ret": -2}))
+        with self.assertRaises(ilink.RateLimited):
+            client.get_updates("buf")
+
+    def test_other_error_codes_raise(self):
+        client = self._client(self._answering({"ret": -1, "errmsg": "boom"}))
+        with self.assertRaises(ilink.ILinkError) as caught:
+            client.get_updates("buf")
+        self.assertEqual(caught.exception.code, -1)
+
+    def test_an_ok_answer_passes_through(self):
+        client = self._client(self._answering({"ret": 0, "msgs": [{"x": 1}], "get_updates_buf": "b2"}))
+        response = client.get_updates("buf")
+        self.assertEqual(response["msgs"], [{"x": 1}])
+        self.assertEqual(response["get_updates_buf"], "b2")
+
+    def test_a_refused_connection_raises_instead_of_an_empty_batch(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        client = self._client(f"http://127.0.0.1:{port}")
+        with self.assertRaises(ilink.ILinkError) as caught:
+            client.get_updates("buf")
+        self.assertNotIsInstance(caught.exception, ilink.PollIdle)
+
+    def test_a_poll_that_times_out_is_an_empty_batch(self):
+        class _Mute(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.recv(65536)
+                threading.Event().wait(3)   # never answer inside the client's timeout
+
+        client = self._client(self._serve(_Mute))
+        original = ilink.LONG_POLL_TIMEOUT_MS
+        ilink.LONG_POLL_TIMEOUT_MS = 1000
+        self.addCleanup(setattr, ilink, "LONG_POLL_TIMEOUT_MS", original)
+        response = client.get_updates("buf")
+        self.assertEqual(response["msgs"], [])
+        self.assertEqual(response["get_updates_buf"], "buf")
 
 
 class AtomicWriteTests(unittest.TestCase):

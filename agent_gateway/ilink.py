@@ -25,6 +25,7 @@ import http.client
 import json
 import os
 import secrets
+import socket
 import threading
 import time
 import urllib.error
@@ -80,6 +81,12 @@ class SessionExpired(ILinkError):
 
 class RateLimited(ILinkError):
     """``ret = -2`` — iLink is throttling; back off and retry."""
+
+
+class PollIdle(ILinkError):
+    """The long poll ended without an answer: a read timeout, or the server dropping
+    an idle connection. That is a normal empty round, unlike a refused connection or
+    a DNS failure, which come back at once and must reach the caller's backoff."""
 
 
 def _uin_header() -> str:
@@ -170,6 +177,10 @@ def _request(method: str, base_url: str, endpoint: str, *, token: Optional[str] 
     except urllib.error.HTTPError as exc:  # pragma: no cover - network path
         raw = exc.read().decode("utf-8", "replace") if exc.fp else ""
         raise ILinkError(f"HTTP {exc.code} on {endpoint}: {raw[:200]}") from exc
+    except (socket.timeout, http.client.RemoteDisconnected) as exc:
+        # Raised while waiting for the answer, after the request went out (failures
+        # to connect arrive as URLError below). socket.timeout is TimeoutError on 3.10+.
+        raise PollIdle(f"network error on {endpoint}: {exc or 'timed out'}") from exc
     except (urllib.error.URLError, TimeoutError, ConnectionError,
             http.client.HTTPException) as exc:
         # ConnectionError covers RemoteDisconnected / ConnectionResetError: the real iLink
@@ -343,16 +354,19 @@ class ILinkClient:
 
     # -- calls -----------------------------------------------------------
     def get_updates(self, cursor: str) -> Dict[str, Any]:
-        """One long-poll round. Rate limits are swallowed into an empty batch."""
+        """One long-poll round.
+
+        Only an idle poll becomes an empty batch. ``ret = -14`` raises
+        ``SessionExpired``, ``ret = -2`` raises ``RateLimited`` and other network
+        errors raise ``ILinkError``, so the caller can re-login or back off instead
+        of polling again at once.
+        """
         try:
-            return _request("POST", self.base_url, EP_GET_UPDATES, token=self.token,
+            data = _request("POST", self.base_url, EP_GET_UPDATES, token=self.token,
                             payload={"get_updates_buf": cursor}, timeout_ms=LONG_POLL_TIMEOUT_MS)
-        except RateLimited:
+        except PollIdle:
             return {"ret": 0, "msgs": [], "get_updates_buf": cursor}
-        except ILinkError as exc:
-            if "network error" in str(exc) or "timed out" in str(exc):
-                return {"ret": 0, "msgs": [], "get_updates_buf": cursor}
-            raise
+        return _raise_for_status(data, "getupdates")
 
     def send_text(self, to: str, text: str, *, context_token: Optional[str] = None,
                   client_id: Optional[str] = None) -> Dict[str, Any]:

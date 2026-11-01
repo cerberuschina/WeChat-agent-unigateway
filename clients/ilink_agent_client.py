@@ -810,6 +810,7 @@ def main(argv: list | None = None) -> int:
     session_command = shlex.split(args.session_command) if args.session_command else []
     peer_sessions: dict = {}
     while True:
+        started = time.monotonic()
         try:
             response = client.get_updates(cursor)
         except ilink.SessionExpired:
@@ -834,6 +835,8 @@ def main(argv: list | None = None) -> int:
             cursor = new_cursor
             creds["cursor"] = cursor
             save_creds(creds_path, creds)
+        if not response.get("msgs") and time.monotonic() - started < 1.0:
+            time.sleep(1)   # 秒回的空批次不是长轮询，别对网关死循环
 
         for message in response.get("msgs") or []:
             text = ilink.message_text(message)

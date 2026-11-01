@@ -5,8 +5,8 @@ arrives as literal asterisks, a table arrives as pipes, and a long answer is
 rejected or mangled by the client's own limits. This module is the layer that
 turns an agent's Markdown into something that *reads* correctly in WeChat:
 
-* inline markers are stripped (``**x**`` → ``x``, backticks → plain), but only
-  outside fenced code — code keeps every character it was written with;
+* inline markers are stripped (``**x**`` → ``x``, backticks → plain), but never
+  inside code — fenced blocks and inline code spans keep every character;
 * headings become ``【标题】``, bullets become ``·``, tables lose their dashes row
   and become readable rows, links become ``标题 (url)``;
 * long answers are split into ≤ ``max_chars`` bubbles **at block boundaries**,
@@ -42,17 +42,36 @@ def _walk(content: str):
             in_code = not in_code
 
 
+_CODE_SPAN_RE = re.compile(r"(`+)(.+?)(?<!`)\1(?!`)")
+_PLACEHOLDER_RE = re.compile(r"\x00(\d+)\x00")
+
+
 def _inline(text: str) -> str:
-    """Strip the markers WeChat would otherwise show literally."""
-    text = re.sub(r"`([^`]+)`", r"\1", text)
-    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
-    text = re.sub(r"__([^_]+)__", r"\1", text)
-    text = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"\1", text)
-    text = re.sub(r"(?<![\w_])_([^_\n]+)_(?![\w_])", r"\1", text)
-    text = re.sub(r"~~([^~]+)~~", r"\1", text)
+    """Strip the markers WeChat would otherwise show literally.
+
+    Code spans are set aside first and put back verbatim (minus their backticks),
+    so ``__init__.py`` or ``*.py`` inside them keeps every character. Emphasis
+    needs a non-space just inside each marker, as in CommonMark, so a glob like
+    *.py and *.js is not read as italics.
+    """
+    spans: List[str] = []
+
+    def stash(match: "re.Match[str]") -> str:
+        body = match.group(2)
+        if len(body) > 1 and body.startswith(" ") and body.endswith(" ") and body.strip():
+            body = body[1:-1]
+        spans.append(body)
+        return f"\x00{len(spans) - 1}\x00"
+
+    text = _CODE_SPAN_RE.sub(stash, text)
+    text = re.sub(r"\*\*(?=\S)([^*]+?)(?<=\S)\*\*", r"\1", text)
+    text = re.sub(r"(?<!\w)__(?=\S)([^_]+?)(?<=\S)__(?!\w)", r"\1", text)
+    text = re.sub(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])", r"\1", text)
+    text = re.sub(r"(?<![\w_])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w_])", r"\1", text)
+    text = re.sub(r"~~(?=\S)([^~]+?)(?<=\S)~~", r"\1", text)
     text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\1 (\2)", text)
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
-    return text
+    return _PLACEHOLDER_RE.sub(lambda m: spans[int(m.group(1))], text)
 
 
 def render(content: str) -> str:
@@ -68,8 +87,9 @@ def render(content: str) -> str:
         if not table_rows:
             return
         for row in table_rows:
-            cells = [c.strip() for c in row.strip().strip("|").split("|")]
-            out.append(" ｜ ".join(c for c in cells if c))
+            # Empty cells stay, or the values after them would shift a column left.
+            cells = [_inline(c.strip()) for c in row.strip()[1:-1].split("|")]
+            out.append(" ｜ ".join(cells))
         table_rows = []
 
     for line, is_fence, in_code in _walk(content):

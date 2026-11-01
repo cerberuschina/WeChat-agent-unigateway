@@ -9,8 +9,8 @@ Design notes that matter in practice (learned the hard way):
   there and the user resends.
 * **Per-chat ordering.** Messages from the same peer are handled by a worker
   pool but serialized per chat, so replies never arrive out of order.
-* **Dedup twice.** By ``message_id`` and by content fingerprint — the upstream
-  re-sends identical text under fresh ids.
+* **Dedup twice.** By ``message_id`` and, for a short window, by content (commands
+  and keepalives excepted) — the upstream re-sends identical text under fresh ids.
 * **Cursor on disk.** ``get_updates_buf`` is persisted so a restart does not
   replay or drop messages.
 """
@@ -35,6 +35,9 @@ from .virtual_ilink import VirtualILinkServer
 log = logging.getLogger("agent_gateway")
 
 ACCOUNT_FILE = "account.json"
+RATE_LIMIT_BACKOFF_SECONDS = 10.0
+MIN_EMPTY_POLL_SECONDS = 1.0
+CONTENT_DEDUP_SECONDS = 60
 
 
 class Gateway:
@@ -296,8 +299,15 @@ class Gateway:
         if message_id and self.store.is_duplicate(f"id:{message_id}"):
             log.debug("duplicate message_id %s", _safe(message_id))
             return
-        if text and self.store.is_duplicate(f"text:{sender}:{self.store.fingerprint(text)}"):
-            log.debug("duplicate content from %s", _safe(sender))
+        # The upstream re-sends the same text under new ids, so free text is also
+        # deduped by content, but only briefly: "继续" or "ok" twice is often meant.
+        # Commands and keepalives skip it (/approve twice answers two cards); a real
+        # replay of those still carries the same message_id.
+        if (text and not router.is_command(text) and not router.is_keepalive(text)
+                and self.store.is_duplicate(f"text:{sender}:{self.store.fingerprint(text)}",
+                                            ttl=CONTENT_DEDUP_SECONDS)):
+            log.info("dropped repeated text from %s within %ds: %s", _safe(sender),
+                     CONTENT_DEDUP_SECONDS, _safe(text, 20))
             return
         # A message from the peer opens a fresh budget (WeChat's per-turn cap), and
         # whatever the previous turn could not deliver goes out first.
@@ -433,11 +443,17 @@ class Gateway:
         self._start_virtual()
         failures = 0
         while not self._stop.is_set():
+            started = time.monotonic()
             try:
                 response = self.client.get_updates(cursor)
             except ilink.SessionExpired:
+                log.error("iLink session expired (ret=-14); scan the QR code again")
                 print("iLink 会话已失效（ret=-14），需要重新扫码：python login.py", file=sys.stderr)
                 return 3
+            except ilink.RateLimited as exc:
+                log.warning("getupdates rate limited, backing off: %s", exc)
+                time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
+                continue
             except ilink.ILinkError as exc:
                 failures += 1
                 log.warning("getupdates failed (%d): %s", failures, exc)
@@ -455,12 +471,17 @@ class Gateway:
             if new_cursor and new_cursor != cursor:
                 cursor = new_cursor
                 self.client.save_cursor(cursor)
-            for message in response.get("msgs") or []:
+            msgs = response.get("msgs") or []
+            for message in msgs:
                 if not isinstance(message, dict):
                     continue
                 self._pool.submit(self._safe_handle, message)
             if once:
                 break
+            # An empty round that came back at once is not a long poll: whatever the
+            # cause, never hammer the server in a tight loop.
+            if not msgs and time.monotonic() - started < MIN_EMPTY_POLL_SECONDS:
+                time.sleep(MIN_EMPTY_POLL_SECONDS)
         return 0
 
     # -- virtual iLink (agents connect to us, not to Tencent) -------------

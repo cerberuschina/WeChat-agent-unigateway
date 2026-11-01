@@ -297,6 +297,18 @@ class GatewayApprovalTests(unittest.TestCase):
         self.assertEqual(later.decision, ALLOW)
         self.assertEqual(len(self.sent), sent_before, "开着 /always 就不该再打扰人")
 
+    def test_a_second_bare_approve_answers_the_second_card(self):
+        """Content dedup must not swallow the same command sent for a new question."""
+        self.gateway._last_peer = "wx-user"
+        first = self.gateway.approvals.request(agent="claude", peer="wx-user", title="想跑 npm test")
+        self.gateway.handle({"from_user_id": "wx-user", "message_id": "m-ap1",
+                             "item_list": [{"type": 1, "text_item": {"text": "/approve"}}]})
+        second = self.gateway.approvals.request(agent="claude", peer="wx-user", title="又想改文件")
+        self.gateway.handle({"from_user_id": "wx-user", "message_id": "m-ap2",
+                             "item_list": [{"type": 1, "text_item": {"text": "/approve"}}]})
+        self.assertEqual(self.gateway.approvals.get(first.id).decision, ALLOW)
+        self.assertEqual(self.gateway.approvals.get(second.id).decision, ALLOW)
+
     def test_saying_anything_else_takes_the_allow_all_back(self):
         self.gateway.handle({"from_user_id": "wx-user", "message_id": "m-a2",
                              "item_list": [{"type": 1, "text_item": {"text": "/always"}}]})
