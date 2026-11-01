@@ -33,6 +33,7 @@ alternative and why it is riskier.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import threading
 import time
@@ -197,8 +198,11 @@ class _AddressAwareServer(ThreadingHTTPServer):
     dual_stack = True
     # Windows lets a second process bind an address another one already holds when
     # SO_REUSEADDR is on (http.server turns it on). Two gateways sharing a port is
-    # a silent mess, so refuse it loudly instead.
-    allow_reuse_address = False
+    # a silent mess, so refuse it loudly there. Elsewhere SO_REUSEADDR only lets a
+    # restart bind over the last run's TIME_WAIT sockets; a live listener still
+    # refuses a second bind. Without it a restarted gateway on Linux failed with
+    # "Address already in use" for about a minute.
+    allow_reuse_address = os.name != "nt"
 
     def __init__(self, address, handler, family=None):
         import socket
