@@ -239,7 +239,9 @@ bridges/           可选桥：bridges/electron_cdp.py 用 CDP 驱动只有桌�
 docs/VIRTUAL-ILINK.md       虚拟 iLink 的设计、接法、批准流程、边界
 docs/DASHBOARD.md           控制台：看状态、批准接入（本机网页，零依赖）
 docs/APPROVALS.md           放行卡：agent 在手机上问一句「可以吗」，沉默=拒绝
-docs/REMOTE-AGENTS.md       非本机 agent 接入：bind_key、上传/下载、安全边界
+docs/REMOTE-AGENTS.md       非本机 agent 接入：bind_key、上传/下载、安全边界、同一 agent 多设备
+docs/DEPLOY-CLOUD.md        云主机 + 多设备统一网关：Tailscale / WireGuard / ssh 隧道，compose
+docs/MEMORY-DESIGN.md       统一记忆设计稿：L0-L3、联系人/全局层、注入 + 检索 API、可换 TencentDB-Agent-Memory
 docs/PROTOCOL.md            iLink 协议实测要点
 docs/BACKENDS-WORKBUDDY.md  WorkBuddy 实测结论 + 两条接法
 docs/JOIN.md               一键接入：每种 agent 一条命令、改了什么、怎么排错
