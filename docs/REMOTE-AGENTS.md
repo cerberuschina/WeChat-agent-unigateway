@@ -101,8 +101,32 @@ python clients/ilink_agent_client.py --name claude \
 - 跨不可信网络：**SSH 隧道**（`ssh -L 18500:127.0.0.1:18500 user@gateway-ip`，agent 侧照旧连
   `http://127.0.0.1:18500`）或**反向代理 + 真证书**（Caddy / nginx）。
 
-## 5. 目前不支持
+## 5. 同一个 agent，多台设备
+
+`virtual.accept_tokens` 的键可以写成 **`agent@设备名`**，每台设备一个 token：
+
+```json
+"accept_tokens": {
+  "hermes@mac-air": "file:/app/data/hermes-mac-air-token.txt",
+  "hermes@win59":   "file:/app/data/hermes-win59-token.txt",
+  "claude@win59":   "file:/app/data/claude-win59-token.txt"
+}
+```
+
+- 同一个 agent 可以同时有多台设备在线，网关按聊天**粘住**回消息的那台；
+  它掉线（90 秒没长轮询）就转到另一台在线设备，日志记 `failing over to …`；
+  全都不在线时消息排在记住的那台队列里，连回来即取。
+- 不带 `@` 的键仍是原来的"单实例"写法，行为不变。
+- 设备侧客户端 `--base-url` 可以给一串地址（Tailscale / WireGuard / SSH 隧道），
+  先探 TCP、用第一条通的，连续失败自动换路；`--device` 只是 creds 文件和日志里的标签，
+  **身份由 token 决定**。
+- 控制台 `agents[].instances` 每台设备一行：在线状态、队列、最后活动。
+- 完整部署步骤见 `docs/DEPLOY-CLOUD.md`；签发 token 用
+  `scripts/mint_device_token.py hermes mac-air --config gateway.json`。
+
+## 6. 目前不支持
 
 - 跨机器的心跳：打字指示仍由网关按心跳（agent → 网关 `sendtyping`）维持，跨机器一路明文。
 - 多网关 / 按 agent 隔离额度：额度账本是**按联系人**算的，与 agent 来自哪台机器无关。
 - 断线续传：`/upload` 是整包上传，大文件目前一次吃完（几十 MB 级别没问题）。
+- 跨设备会话迁移：一个聊天粘在一台设备上，不会把会话状态搬到另一台。

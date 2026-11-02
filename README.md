@@ -199,7 +199,8 @@ python -m agent_gateway --config gateway.json
 
 - **凭证只在本机**：`data/account.json` 是 bot token，权限 600，`.gitignore` 已挡住。
   它等价于"以这个 bot 的身份收发消息"，不要外传、不要提交。
-- **只监听本地**：网关不开放任何入站端口（iLink 是长轮询，出站即可）。
+- **默认只监听本地**：虚拟 iLink 默认绑 `127.0.0.1`。要给别的设备用，按
+  `docs/DEPLOY-CLOUD.md` 配 VPN、`allow_cidrs` 和每设备 token；公网不要直接开 18500。
 - **一个身份一个进程**：别让网关和别的程序（比如 Hermes 自己的 weixin 渠道）同时轮询同一个 bot 身份，
   那会互相抢消息。要切换入口时，先停一边。
 - **`access.allowed_users`**：默认谁给这个 bot 发消息都会被转给 agent。多用户环境请填白名单。
@@ -256,6 +257,10 @@ tests/             326 项离线测试
 - [x] 虚拟身份落盘：绑定（身份 + token + 游标 + context_token）写进 `data/virtual/binds.json`，
       网关重启后 agent 不用重扫，手里的 token 照样认得出它
 - [ ] 开机自启脚本（Windows Startup / systemd unit）
+- [x] 云主机 + 多设备：一台网关持微信身份，多台机器的 `hermes` / `claude` / `workbuddy`
+      通过 Tailscale / WireGuard / SSH 隧道接入，同一 agent 多实例按聊天粘住并故障转移
+      （见 `docs/DEPLOY-CLOUD.md`，Dockerfile / `docker-compose.cloud.yml` /
+      `gateway.cloud.example.json` 都在仓库里）
 
 ## License
 

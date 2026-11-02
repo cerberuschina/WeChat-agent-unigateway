@@ -138,6 +138,13 @@ def _is_private_host(host: str) -> bool:
         except (IndexError, ValueError):
             return False
         return 16 <= second <= 31
+    if host.startswith("100."):
+        # 100.64.0.0/10: carrier-grade NAT, and the range Tailscale hands out.
+        try:
+            second = int(host.split(".")[1])
+        except (IndexError, ValueError):
+            return False
+        return 64 <= second <= 127
     return False
 
 

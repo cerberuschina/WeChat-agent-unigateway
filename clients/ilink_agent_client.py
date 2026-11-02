@@ -718,8 +718,14 @@ def handle_session_command(command: str, argument: str, *, sender: str, message:
 def main(argv: list | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run an agent on WeChat via the virtual gateway")
     parser.add_argument("--name", default="agent", help="this agent's name (must match the gateway config)")
-    parser.add_argument("--base-url", default="http://127.0.0.1:18500",
-                        help="the gateway's virtual iLink server")
+    parser.add_argument("--base-url", default="",
+                        help="the gateway's virtual iLink server; give several addresses "
+                             "separated by commas (Tailscale, WireGuard, ssh tunnel) and the "
+                             "client uses the first that answers, switching when one dies")
+    parser.add_argument("--device", default="",
+                        help="a label for this machine (e.g. mac-air), used in the default "
+                             "creds file name and the log; the gateway identity comes from "
+                             "the token configured in virtual.accept_tokens")
     parser.add_argument("--runner", default="", help=f"command template, e.g. 'claude -p {PLACEHOLDER}'")
     parser.add_argument("--stdin", action="store_true", help="pipe the message into the command instead")
     parser.add_argument("--cwd", default="", help="working directory for the agent command")
@@ -756,27 +762,42 @@ def main(argv: list | None = None) -> int:
                              "an identity (also via the ILINK_BIND_KEY environment variable)")
     args = parser.parse_args(argv)
 
-    creds_path = Path(args.creds) if args.creds else Path("data") / f"virtual-client-{args.name}.json"
+    device_suffix = f"-{args.device}" if args.device else ""
+    creds_path = (Path(args.creds) if args.creds
+                  else Path("data") / f"virtual-client-{args.name}{device_suffix}.json")
     if args.bind_key:
         # The QR request is built deep inside ilink.fetch_qr; the env is how the
         # key travels without threading it through every call.
         os.environ["ILINK_BIND_KEY"] = args.bind_key
     creds = load_creds(creds_path)
+    # Every route to the same gateway, in preference order. Previous runs keep
+    # theirs in the creds file, so a VPN that moved (new tailnet IP) is found again.
+    explicit_url = bool((args.base_url or "").strip())
+    saved_url = str((creds or {}).get("base_url") or "")
+    candidates = parse_endpoints(args.base_url, os.environ.get("ILINK_GATEWAY_URL", ""),
+                                 (creds or {}).get("endpoints", ""), saved_url)
+    # A URL typed on the command line wins; otherwise the one that worked last time.
+    start_url = pick_endpoint(candidates, current="" if explicit_url else saved_url) \
+        or "http://127.0.0.1:18500"
 
     if args.reuse_token:
         # The agent is already bound to the real WeChat: keep that token, the
         # gateway accepts it as this agent's alias.
         creds = {"account_id": f"reuse-{args.name}", "token": args.reuse_token,
-                 "base_url": args.base_url, "cursor": "", "name": args.name}
+                 "base_url": start_url, "cursor": "", "name": args.name}
         save_creds(creds_path, creds)
 
     if not creds:
-        creds = do_login(args.base_url, args.name, png=args.png,
+        creds = do_login(start_url, args.name, png=args.png,
                          max_refreshes=args.max_refreshes, timeout=args.login_timeout)
         save_creds(creds_path, creds)
+    creds["endpoints"] = candidates
+    creds.setdefault("base_url", start_url)
 
     client = ilink.ILinkClient(creds["account_id"], creds["token"], base_url=creds["base_url"])
-    log(f"身份 {creds['account_id']}，服务端 {creds['base_url']}，凭证 {creds_path}")
+    device = f"，设备 {args.device}" if args.device else ""
+    log(f"身份 {creds['account_id']}{device}，服务端 {creds['base_url']}，凭证 {creds_path}"
+        + (f"（备用 {len(candidates) - 1} 条线路）" if len(candidates) > 1 else ""))
 
     try:                                     # a stale token must re-login, not spin
         client.get_config(creds["account_id"])
@@ -787,7 +808,26 @@ def main(argv: list | None = None) -> int:
         save_creds(creds_path, creds)
         client = ilink.ILinkClient(creds["account_id"], creds["token"], base_url=creds["base_url"])
     except ilink.ILinkError as exc:
-        log(f"（探测身份时出问题，先继续：{exc}）")
+        # The first route is dead (VPN down, address moved): try the others.
+        switched = False
+        for url in candidates:
+            if url == client.base_url:
+                continue
+            probe = ilink.ILinkClient(creds["account_id"], creds["token"], base_url=url)
+            try:
+                probe.get_config(creds["account_id"])
+            except ilink.SessionExpired:
+                break        # reachable but the token is gone: handled above/below
+            except ilink.ILinkError:
+                continue
+            log(f"（{client.base_url} 不通，改走 {url}）")
+            client, switched = probe, True
+            break
+        if not switched:
+            log(f"（探测身份时出问题，先继续：{exc}）")
+
+    creds["base_url"] = client.base_url
+    save_creds(creds_path, creds)
 
     if args.login_only:
         print(json.dumps({k: creds[k] for k in ("account_id", "base_url", "name")},
@@ -809,6 +849,7 @@ def main(argv: list | None = None) -> int:
     handled = 0
     session_command = shlex.split(args.session_command) if args.session_command else []
     peer_sessions: dict = {}
+    failures = 0
     while True:
         started = time.monotonic()
         try:
@@ -820,16 +861,39 @@ def main(argv: list | None = None) -> int:
             time.sleep(2)
             continue
         except ilink.ILinkError as exc:
+            failures += 1
             log(f"取消息失败：{exc}（2 秒后重试）")
             time.sleep(2)
+            if failures >= 2 and len(candidates) > 1:
+                failures = 0
+                target = next((u for u in candidates
+                               if u != client.base_url and endpoint_reachable(u)), "")
+                if target:
+                    log(f"这条线路连着失败，换到 {target}")
+                    client = ilink.ILinkClient(creds["account_id"], creds["token"],
+                                               base_url=target)
+                    creds["base_url"] = target
+                    save_creds(creds_path, creds)
             continue
         except Exception as exc:  # noqa: BLE001 - 网关重启会把长轮询掐断
             # 今天咬过一次：我重启网关，客户端一个 ConnectionResetError 就退出了，
             # 微信那条链路跟着死。连接断了是重启的正常副作用，重试就行，不该退出。
+            failures += 1
             log(f"和网关的连接断了（{exc}），5 秒后重连。")
             time.sleep(5)
+            if failures >= 2 and len(candidates) > 1:
+                failures = 0
+                target = next((u for u in candidates
+                               if u != client.base_url and endpoint_reachable(u)), "")
+                if target:
+                    log(f"这条线路连着失败，换到 {target}")
+                    client = ilink.ILinkClient(creds["account_id"], creds["token"],
+                                               base_url=target)
+                    creds["base_url"] = target
+                    save_creds(creds_path, creds)
             continue
 
+        failures = 0
         new_cursor = str(response.get("get_updates_buf") or "")
         if new_cursor and new_cursor != cursor:
             cursor = new_cursor
@@ -932,6 +996,49 @@ def is_local_gateway(base_url: str) -> bool:
 
     host = (_urlparse.urlsplit(base_url or "").hostname or "").lower()
     return host in {"127.0.0.1", "localhost", "::1", "0.0.0.0", ""}
+
+
+def parse_endpoints(*sources) -> list:
+    """Gateway addresses from flags/env/creds -> ordered, de-duplicated list.
+
+    ``--base-url "http://100.x:18500,http://10.8.0.2:18500,http://127.0.0.1:18500"``
+    is how one client is given the Tailscale, WireGuard and tunnel routes at
+    once; it uses the first one that answers.
+    """
+    out: list = []
+    for source in sources:
+        parts = source if isinstance(source, (list, tuple)) else re.split(r"[,;\s]+", str(source or ""))
+        for part in parts:
+            url = str(part).strip().rstrip("/")
+            if url and url not in out:
+                out.append(url)
+    return out
+
+
+def endpoint_reachable(base_url: str, timeout: float = 2.5) -> bool:
+    """A plain TCP connect: enough to tell a dead VPN route from a live one."""
+    import socket
+    import urllib.parse as _urlparse
+
+    parsed = _urlparse.urlsplit(base_url or "")
+    host = parsed.hostname
+    if not host:
+        return False
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def pick_endpoint(candidates, *, current: str = "") -> str:
+    """Prefer where we already are (no flapping), then the first address that answers."""
+    ordered = ([current] if current else []) + [u for u in candidates if u != current]
+    for url in ordered:
+        if endpoint_reachable(url):
+            return url
+    return candidates[0] if candidates else current
 
 
 def _no_proxy_opener():

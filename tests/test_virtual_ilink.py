@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from pathlib import Path
@@ -681,3 +682,160 @@ class RebindTests(unittest.TestCase):
         finally:
             first.shutdown()
             first.server_close()
+
+
+class MultiInstanceTests(unittest.TestCase):
+    """One agent, several devices: every token in accept_tokens owns an instance."""
+
+    TOK_AIR = "tok-hermes-air"
+    TOK_WIN = "tok-hermes-win"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.server = self._new_server()
+        self.host, self.port = self.server.start()
+
+    def tearDown(self):
+        self.server.stop()
+        self._tmp.cleanup()
+
+    def _new_server(self, **kw) -> VirtualILinkServer:
+        return VirtualILinkServer(data_dir=self.dir, port=0,
+                                  accept_tokens={self.TOK_AIR: "hermes@mac-air",
+                                                 self.TOK_WIN: "hermes@win59"}, **kw)
+
+    def _bind(self, token: str):
+        return self.server._bind_for_token(token)
+
+    def test_each_token_is_its_own_device_instance(self):
+        air, win = self._bind(self.TOK_AIR), self._bind(self.TOK_WIN)
+        self.assertEqual((air.name, air.instance), ("hermes", "mac-air"))
+        self.assertEqual((win.name, win.instance), ("hermes", "win59"))
+        self.assertNotEqual(air.account_id, win.account_id)
+        self.assertEqual(self.server.agent_names(), ["hermes"], "名字只算一次，设备是实例")
+
+    def test_the_device_that_answered_the_chat_keeps_getting_it(self):
+        air, win = self._bind(self.TOK_AIR), self._bind(self.TOK_WIN)
+        self.server.deliver("hermes", text="第一句", peer="wx-user")
+        got_air = air.drain("", 0.05)[1]
+        got_win = win.drain("", 0.05)[1]
+        self.assertEqual(len(got_air) + len(got_win), 1)
+        answered = air if got_air else win
+        other = win if answered is air else air
+        self.server.ep_sendmessage(answered, {"msg": {"item_list": [
+            {"type": 1, "text_item": {"text": "答"}}]}})
+
+        other.last_seen = time.time() + 10      # the other one is fresher now
+        self.server.deliver("hermes", text="第二句", peer="wx-user")
+        self.assertEqual(len(answered.drain("", 0.05)[1]), 1)
+        self.assertEqual(len(other.drain("", 0.05)[1]), 0)
+
+    def test_an_offline_preferred_device_fails_over_to_a_connected_one(self):
+        air, win = self._bind(self.TOK_AIR), self._bind(self.TOK_WIN)
+        air.deliver(text="先给你", peer="wx-user")
+        air.drain("", 0.05)
+        self.server.ep_sendmessage(air, {"msg": {"item_list": [
+            {"type": 1, "text_item": {"text": "答"}}]}})
+        air.last_seen = time.time() - 10_000       # this device went away
+        win.last_seen = time.time()
+
+        self.server.deliver("hermes", text="交给在线的", peer="wx-user")
+        self.assertEqual(len(win.drain("", 0.05)[1]), 1)
+
+    def test_with_everything_offline_the_message_waits_for_the_remembered_device(self):
+        air, win = self._bind(self.TOK_AIR), self._bind(self.TOK_WIN)
+        air.deliver(text="记一下", peer="wx-user")
+        air.drain("", 0.05)
+        self.server.ep_sendmessage(air, {"msg": {"item_list": [
+            {"type": 1, "text_item": {"text": "答"}}]}})
+        air.last_seen = win.last_seen = time.time() - 10_000
+
+        self.assertTrue(self.server.deliver("hermes", text="等你回来", peer="wx-user"))
+        self.assertEqual(len(air.drain("", 0.05)[1]), 1, "回连的设备应拿到排队的那条")
+
+    def test_instances_survive_a_restart(self):
+        self._bind(self.TOK_AIR)
+        self.server.stop()
+        again = self._new_server()
+        again.start()
+        try:
+            restored = again._bind_for_token(self.TOK_AIR)
+            self.assertEqual((restored.name, restored.instance), ("hermes", "mac-air"))
+            self.assertEqual(sorted(b.instance for b in again.binds_named("hermes")),
+                             ["mac-air", "win59"])
+        finally:
+            again.stop()
+
+
+class InstanceConfigTests(unittest.TestCase):
+    """``accept_tokens`` keys may name a device instance: ``hermes@mac-air``."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _config(self, accept_tokens: dict) -> Path:
+        path = self.tmp / "cfg.json"
+        path.write_text(json.dumps({
+            "data_dir": str(self.tmp / "data"),
+            "virtual": {"enabled": True, "port": 0, "accept_tokens": accept_tokens},
+            "agents": {"hermes": {"type": "virtual", "label": "Hermes", "prefix": "h"}},
+        }, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def test_an_instance_key_is_accepted(self):
+        cfg = load_config(self._config({"hermes@mac-air": "tok-a", "hermes@win59": "tok-b"}))
+        self.assertEqual(list(cfg.virtual.accept_tokens), ["hermes@mac-air", "hermes@win59"])
+
+    def test_an_unknown_agent_in_an_instance_key_is_refused(self):
+        with self.assertRaises(ConfigError):
+            load_config(self._config({"ghost@mac-air": "tok"}))
+
+    def test_an_empty_or_unusable_instance_label_is_refused(self):
+        with self.assertRaises(ConfigError):
+            load_config(self._config({"hermes@": "tok"}))
+        with self.assertRaises(ConfigError):
+            load_config(self._config({"hermes@bad name": "tok"}))
+
+
+class GatewayMultiInstanceTests(unittest.TestCase):
+    """The gateway hands a chat to one device and shows every device it knows."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        path = self.tmp / "cfg.json"
+        path.write_text(json.dumps({
+            "data_dir": str(self.tmp / "data"),
+            "default_agent": "hermes",
+            "virtual": {"enabled": True, "port": 0,
+                        "accept_tokens": {"hermes@mac-air": "tok-air",
+                                          "hermes@win59": "tok-win"}},
+            "agents": {"hermes": {"type": "virtual", "label": "Hermes", "prefix": "h"}},
+        }, ensure_ascii=False), encoding="utf-8")
+        self.cfg = load_config(path)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_message_goes_to_exactly_one_device_and_both_are_listed(self):
+        gateway = Gateway(self.cfg, dry_run=True)
+        try:
+            gateway._start_virtual()
+            binds = gateway.virtual.binds_named("hermes")
+            self.assertEqual(sorted(b.instance for b in binds), ["mac-air", "win59"])
+
+            gateway.handle({"from_user_id": "wx-user", "message_id": "m1",
+                            "context_token": "ctx",
+                            "item_list": [{"type": 1, "text_item": {"text": "在吗"}}]})
+            self.assertEqual(sum(len(b.queue) for b in binds), 1, "只投给一个设备")
+
+            agent = gateway.snapshot()["agents"][0]
+            self.assertEqual(sorted(i["bind_id"] for i in agent["instances"]),
+                             ["hermes@mac-air", "hermes@win59"])
+        finally:
+            gateway.shutdown()

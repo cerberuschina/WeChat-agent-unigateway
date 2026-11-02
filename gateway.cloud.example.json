@@ -1,0 +1,77 @@
+{
+  "_comment": "云主机 + 多设备统一网关的配置模板，复制到 config/gateway.json 再改（见 docs/DEPLOY-CLOUD.md）。这里演示：一台云主机持有微信身份，多台设备各自跑 hermes / claude / workbuddy 实例，通过 Tailscale、WireGuard 或 SSH 隧道接进来，三条线路互备。",
+
+  "account": {
+    "account_id": "",
+    "token": "",
+    "base_url": "https://ilinkai.weixin.qq.com"
+  },
+
+  "_account": "首次登录在服务器上跑 python login.py（或 python -m agent_gateway --login），扫码后凭据写进 data/account.json。整个网关只能有一个进程在长轮询这个身份。",
+
+  "data_dir": "/app/data",
+
+  "default_agent": "hermes",
+
+  "virtual": {
+    "enabled": true,
+    "_host": "host 网络下写 0.0.0.0 即可；想只让 tailnet 访问就改成本机的 100.x 地址（wg0 同理写 10.8.0.1）",
+    "host": "0.0.0.0",
+    "port": 18500,
+    "auto_approve": [],
+    "_auto_approve": "远程部署保持为空：身份一律靠下面的 accept_tokens，扫码领身份会把待领取的绑定发给随便哪台设备。",
+    "public_url": "http://100.64.0.1:18500",
+    "_public_url": "设备实际使用的网关地址（tailnet IP / wg IP / 域名均可）。媒体下载链接和取码返回的 baseurl 都用它。",
+    "allow_cidrs": ["127.0.0.1/32", "::1/128", "100.64.0.0/10", "10.0.0.0/8"],
+    "_allow_cidrs": "能连 agent 接口的来源：本机、Tailscale（100.64/10）、WireGuard（10.0.0.0/8）。公网网段不要写进来。",
+    "admin_cidrs": ["127.0.0.1/32", "::1/128"],
+    "_admin_cidrs": "批准/列表/健康检查只对本机开：控制台用 ssh -L 看。想让手机批准，再把 tailnet 段加进来并自己权衡。",
+    "bind_key": "",
+    "_bind_key": "token 方式接入时不依赖它；如果允许新设备扫码加入，务必设一个预共享密钥。",
+    "accept_tokens": {
+      "hermes@mac-air": "file:/app/data/hermes-mac-air-token.txt",
+      "hermes@win59": "file:/app/data/hermes-win59-token.txt",
+      "claude@mac-air": "file:/app/data/claude-mac-air-token.txt",
+      "workbuddy@win59": "file:/app/data/workbuddy-win59-token.txt"
+    },
+    "_accept_tokens": "键是 agent@设备名：同一个 agent 可以有任意多台设备，每台一个 token（scripts/mint_device_token.py 生成）。设备拿错 token 就是拿错身份；撤销 = 删掉这一行并重启网关。"
+  },
+
+  "agents": {
+    "hermes": {
+      "type": "virtual",
+      "label": "Hermes",
+      "prefix": "h"
+    },
+    "claude": {
+      "type": "virtual",
+      "label": "Claude Code",
+      "prefix": "c"
+    },
+    "workbuddy": {
+      "type": "virtual",
+      "label": "WorkBuddy",
+      "prefix": "w"
+    }
+  },
+
+  "_routing": "同一个 agent 的多台设备：先按聊天粘住（哪台回的消息，下一条还给它）；它掉线就转给在线的另一台，并记日志；全都不在线时消息排队，等记住的那台连回来。控制台 /api/state 的 agents[].instances 能看到每台在线状态。",
+
+  "delivery": {
+    "max_chars_per_message": 1800,
+    "ack": true,
+    "ack_template": "已转给 {label}，算完就回。",
+    "error_template": "「{label}」这次没跑通：{error}",
+    "queue_template": "队列里还有 {n} 条，按顺序回。"
+  },
+
+  "access": {
+    "allowed_users": []
+  },
+
+  "dashboard": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 18600
+  }
+}
