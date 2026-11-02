@@ -396,6 +396,18 @@ class Gateway:
                 reply = f"「{agent.display}」没有返回任何内容。"
             self._send(sender, reply)
 
+    def _virtual_unreachable(self, agent) -> str:
+        """Why a message could not reach a virtual agent, in terms of devices."""
+        binds_named = getattr(self.virtual, "binds_named", None) if self.virtual else None
+        known = binds_named(agent.name) if binds_named else []
+        if known:
+            devices = "、".join(b.bind_id for b in known)
+            return (f"「{agent.display}」接入过的设备现在都不在线（{devices}），"
+                    f"等哪台连回来这条会送到它那里。")
+        return (f"「{agent.display}」还没接入：在设备上运行客户端并带上专属 token "
+                f"（gateway.json 的 virtual.accept_tokens），然后看 "
+                f"{self.virtual.base_url() if self.virtual else ''}/admin/binds")
+
     def _dispatch_virtual(self, agent, text: str, sender: str, message_id: str,
                           context_token: str, *, busy: str = "") -> None:
         if not self.virtual:
@@ -420,8 +432,7 @@ class Gateway:
         delivered = self.virtual.deliver(agent.name, text=text, peer=sender,
                                         message_id=message_id, context_token=context_token)
         if not delivered:
-            self._send(sender, f"「{agent.display}」还没接入：让它在自己那边发起一次微信扫码登录，"
-                               f"然后在这里批准 → {self.virtual.base_url()}/admin/binds")
+            self._send(sender, self._virtual_unreachable(agent))
             return
         self._record("in", sender, agent.name, text)
         if self.cfg.delivery.ack and not self.dry_run:
@@ -615,12 +626,20 @@ class Gateway:
             # Only a virtual agent has a bind; an a2a/http/exec agent is simply reachable.
             bind = (self.virtual.bind_named(agent.name)
                     if self.virtual and agent.type == "virtual" else None)
+            instances = (self.virtual.binds_named(agent.name)
+                         if self.virtual and agent.type == "virtual" else [])
             agents.append({
                 "name": agent.name, "label": agent.label, "type": agent.type,
                 "bound": bool(bind), "prefix": agent.prefix,
                 "account_id": bind.account_id if bind else "",
                 "queue": len(bind.queue) if bind else 0,
                 "last_seen": bind.last_seen if bind else 0,
+                # One device per instance: the console shows which machines are
+                # connected, not just whether the agent name has any bind.
+                "instances": [{"bind_id": b.bind_id, "online": b.online(),
+                               "queue": len(b.queue), "last_seen": b.last_seen,
+                               "account_id": b.account_id}
+                              for b in instances],
             })
         virtual: dict = {"enabled": self.cfg.virtual.enabled}
         if self.virtual:
@@ -738,8 +757,7 @@ class Gateway:
         delivered = self.virtual.deliver(agent.name, text=text, peer=sender,
                                          message_id=message_id, context_token=context_token)
         if not delivered:
-            self._send(sender, f"「{agent.display}」还没接入：让它在自己那边发起一次微信扫码登录，"
-                               f"然后在这里批准 → {self.virtual.base_url()}/admin/binds")
+            self._send(sender, self._virtual_unreachable(agent))
             return
         log.info("/%s -> %s from %s", decision.kind, agent.name, _safe(sender))
         self._record("in", sender, agent.name, text)

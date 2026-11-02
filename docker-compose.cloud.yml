@@ -1,0 +1,37 @@
+# 云主机编排（Linux）。host 网络：容器里的 18500/18600 就是宿主机的，网关能
+# 直接绑 0.0.0.0 或某块网卡（tailscale0 / wg0），微信长轮询不经过 Docker NAT。
+#
+#   mkdir -p config data
+#   cp gateway.cloud.example.json config/gateway.json   # 按 docs/DEPLOY-CLOUD.md 改
+#   sudo docker compose -f docker-compose.cloud.yml up -d --build
+#
+# 防火墙要放行的只有设备到 18500 的那条路（tailscale0 / wg0 / 本机隧道），
+# 18500 不要对公网开：
+#   ufw allow in on tailscale0 to any port 18500 proto tcp
+#   ufw allow in on wg0        to any port 18500 proto tcp
+# 18600（控制台）默认只绑 127.0.0.1，用 ssh -L 看。
+services:
+  gateway:
+    build: .
+    image: wechat-agent-unigateway:latest
+    container_name: agent-gateway
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    working_dir: /app
+    volumes:
+      - ./config:/config:ro
+      - ./data:/app/data
+    environment:
+      TZ: Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:18500/health', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

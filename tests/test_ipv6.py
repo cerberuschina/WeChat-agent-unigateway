@@ -117,6 +117,8 @@ class ProxyBypassTests(unittest.TestCase):
         self.assertTrue(_is_private_host("169.254.10.1"))
         self.assertTrue(_is_private_host("fe80::1"))
         self.assertTrue(_is_private_host("fd00::1"))
+        self.assertTrue(_is_private_host("100.64.0.1"))      # CGNAT / Tailscale
+        self.assertTrue(_is_private_host("100.95.111.58"))
 
     def test_public_targets_keep_the_default_opener(self):
         from agent_gateway.ilink import _is_private_host, _opener_for
@@ -124,6 +126,7 @@ class ProxyBypassTests(unittest.TestCase):
         self.assertFalse(_is_private_host("ilinkai.weixin.qq.com"))
         self.assertFalse(_is_private_host("172.32.0.1"))
         self.assertFalse(_is_private_host("240e:3b7::5"))
+        self.assertFalse(_is_private_host("100.128.0.1"))
         self.assertIsNone(_opener_for("https://ilinkai.weixin.qq.com/ilink/bot/getupdates"))
         self.assertIsNotNone(_opener_for("http://192.168.1.5:18500/health"))
         self.assertIsNotNone(_opener_for("http://[::1]:18500/health"))

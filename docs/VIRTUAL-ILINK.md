@@ -239,7 +239,8 @@ python clients/ilink_agent_client.py --name claude \
 
 ## 安全边界
 
-- 虚拟服务只绑 `127.0.0.1`；本机任何程序都能向它要一个身份，**所以用 auto_approve 之外
-  的一切绑定都要人工批准**。
-- 虚拟 token 只在本机流转；真凭证仍然只在 `data/account.json`（600 权限）。
+- 虚拟服务默认只绑 `127.0.0.1`；本机任何程序都能向它要一个身份，**所以用 auto_approve 之外
+  的一切绑定都要人工批准**。要多设备接入，见 `docs/REMOTE-AGENTS.md` 与
+  `docs/DEPLOY-CLOUD.md`：`allow_cidrs` 限网段、每台设备一个 `agent@设备名` token。
+- 虚拟 token 只在本机（或你的 VPN）流转；真凭证仍然只在 `data/account.json`（600 权限）。
 - 网关不会把虚拟身份的任何东西发往腾讯。

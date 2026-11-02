@@ -58,9 +58,18 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 0
 LONG_POLL_SECONDS = 30.0
 BIND_TTL_SECONDS = 600.0
+# A device instance counts as connected while it long-polls: the poll holds for
+# about 35 s, so anything comfortably longer means "it stopped polling".
+ONLINE_TTL_SECONDS = 90.0
 # How long a "/stop" stays pending. Long enough that an agent which only checks
 # between steps still sees it, short enough that it never kills a *later* run.
 STOP_TTL_SECONDS = 120.0
+
+
+def _split_identity(value: str) -> Tuple[str, str]:
+    """``hermes@mac-air`` -> ("hermes", "mac-air"); bare ``hermes`` -> ("hermes", "")."""
+    agent, _, instance = (value or "").strip().partition("@")
+    return agent.strip().lower(), instance.strip()
 
 
 def virtual_account_id(name: str) -> str:
@@ -72,8 +81,11 @@ def virtual_account_id(name: str) -> str:
 class VirtualBind:
     """One agent's virtual WeChat identity."""
 
-    def __init__(self, name: str, *, qrcode: str = "", note: str = ""):
+    def __init__(self, name: str, *, qrcode: str = "", note: str = "", instance: str = ""):
         self.name = name
+        # One machine running this agent: "mac-air", "win59", "vps". Empty keeps
+        # the old single-instance meaning (one bind per agent name).
+        self.instance = instance
         self.note = note
         self.qrcode = qrcode or secrets.token_hex(16)
         self.account_id = virtual_account_id(name)
@@ -93,6 +105,14 @@ class VirtualBind:
 
     # -- lifecycle -------------------------------------------------------
     @property
+    def bind_id(self) -> str:
+        """``hermes@mac-air`` (or just ``hermes`` for the unnamed instance)."""
+        return f"{self.name}@{self.instance}" if self.instance else self.name
+
+    def online(self, ttl: float = ONLINE_TTL_SECONDS) -> bool:
+        return self.confirmed and (time.time() - self.last_seen) <= ttl
+
+    @property
     def confirmed(self) -> bool:
         return self.confirmed_at is not None
 
@@ -103,6 +123,9 @@ class VirtualBind:
     def as_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
+            "instance": self.instance,
+            "bind_id": self.bind_id,
+            "online": self.online(),
             "note": self.note,
             "qrcode": self.qrcode,
             "account_id": self.account_id,
@@ -120,6 +143,7 @@ class VirtualBind:
     def to_state(self) -> Dict[str, Any]:
         return {
             "name": self.name,
+            "instance": self.instance,
             "note": self.note,
             "qrcode": self.qrcode,
             "account_id": self.account_id,
@@ -135,7 +159,8 @@ class VirtualBind:
 
     @classmethod
     def from_state(cls, data: Dict[str, Any]) -> "VirtualBind":
-        bind = cls(str(data.get("name") or "agent"), note=str(data.get("note") or ""))
+        bind = cls(str(data.get("name") or "agent"), note=str(data.get("note") or ""),
+                   instance=str(data.get("instance") or ""))
         bind.qrcode = str(data.get("qrcode") or bind.qrcode)
         bind.account_id = str(data.get("account_id") or bind.account_id)
         bind.token = str(data.get("token") or bind.token)
@@ -250,8 +275,10 @@ class VirtualILinkServer:
         self.dir = Path(data_dir).expanduser()
         self.dir.mkdir(parents=True, exist_ok=True)
         self.auto_approve = [n.lower() for n in (auto_approve or [])]
-        # real token -> agent name (see config.VirtualConfig.reuse_real_token_for)
-        self.accept_tokens = {t: n for t, n in (accept_tokens or {}).items() if t and n}
+        # real token -> (agent, instance); the instance part is optional, e.g.
+        # {"tok": "hermes"} or {"tok": "hermes@mac-air"} (see config.accept_tokens).
+        self.accept_tokens = {t: _split_identity(n)
+                              for t, n in (accept_tokens or {}).items() if t and n}
         self.on_outbound = on_outbound
         # Media a virtual agent wants delivered: the gateway turns these into real
         # iLink items (upload + encrypt) on its own way out.
@@ -282,6 +309,10 @@ class VirtualILinkServer:
         self._by_token: Dict[str, VirtualBind] = {}
         # peer -> deadline: "/stop" requests waiting for their agent to notice.
         self._stops: Dict[str, float] = {}
+        # peer -> bind_id ("hermes@mac-air"): which device instance answered this
+        # chat last, so the next message of the same conversation goes to it while
+        # it is connected. Persisted with the binds: a restart must not reshuffle.
+        self._peer_bind: Dict[str, str] = {}
         self._state_path = self.dir / "binds.json"
         self._load_state()
         self._httpd: Optional[ThreadingHTTPServer] = None
@@ -308,6 +339,9 @@ class VirtualILinkServer:
             self._binds[bind.qrcode] = bind
             self._by_token[bind.token] = bind
             restored += 1
+        peers = raw.get("peers")
+        if isinstance(peers, dict):
+            self._peer_bind = {str(k): str(v) for k, v in peers.items() if k and v}
         if restored:
             self._log(f"virtual: restored {restored} bind(s) from {self._state_path.name}")
 
@@ -319,7 +353,14 @@ class VirtualILinkServer:
             if bind.confirmed:
                 with bind.lock:
                     snapshot.append(bind.to_state())
-        _atomic_write(self._state_path, {"binds": snapshot})
+        with self._lock:
+            peers = dict(self._peer_bind)
+        _atomic_write(self._state_path, {"binds": snapshot, "peers": peers})
+        # The file holds every virtual token; account.json is 0600, this was not.
+        try:
+            os.chmod(self._state_path, 0o600)
+        except OSError:
+            pass
 
     # -- state -----------------------------------------------------------
     def binds(self) -> List[Dict[str, Any]]:
@@ -328,18 +369,59 @@ class VirtualILinkServer:
 
     def agent_names(self) -> List[str]:
         with self._lock:
-            return [b.name for b in self._binds.values() if b.confirmed and not b.expired]
+            names = [b.name for b in self._binds.values() if b.confirmed and not b.expired]
+        return list(dict.fromkeys(names))          # one entry per agent, not per device
 
-    def bind_named(self, name: str) -> Optional[VirtualBind]:
+    def binds_named(self, name: str) -> List[VirtualBind]:
+        """Every connected-or-remembered instance of one agent (one per device)."""
         wanted = name.lower()
         with self._lock:
-            for bind in self._binds.values():
-                if bind.name.lower() == wanted and bind.confirmed and not bind.expired:
-                    return bind
-        return None
+            return [b for b in self._binds.values()
+                    if b.name.lower() == wanted and b.confirmed and not b.expired]
 
-    def request_bind(self, name: str = "", note: str = "") -> VirtualBind:
-        bind = VirtualBind(name or "agent", note=note)
+    def bind_named(self, name: str) -> Optional[VirtualBind]:
+        """The representative instance of an agent.
+
+        With one instance this is it. With several, prefer the unnamed one (the
+        old single-device setup) and otherwise the most recently seen, so callers
+        that only need *a* bind (snapshot, approval delivery) stay sensible.
+        """
+        candidates = self.binds_named(name)
+        if not candidates:
+            return None
+        plain = [b for b in candidates if not b.instance]
+        if plain:
+            return plain[0]
+        return max(candidates, key=lambda b: b.last_seen)
+
+    def pick_bind(self, name: str, peer: str = "") -> Optional[VirtualBind]:
+        """Choose which device instance handles a message for this agent.
+
+        1. the instance that answered this chat last, while it is connected;
+        2. otherwise a connected instance (least queued, then most recently seen);
+        3. otherwise a remembered instance for the preferred device — queued, so
+           it arrives when that device reconnects;
+        4. otherwise the only remembered instance, if there is exactly one.
+        """
+        candidates = self.binds_named(name)
+        if not candidates:
+            return None
+        preferred_id = self._peer_bind.get(peer) if peer else ""
+        preferred = next((b for b in candidates if b.bind_id == preferred_id), None)
+        if preferred is not None and preferred.online():
+            return preferred
+        online = [b for b in candidates if b.online()]
+        if online:
+            if preferred is not None:
+                self._log(f"virtual: {preferred.bind_id} is offline; "
+                          f"failing over to {online[0].bind_id}")
+            return min(online, key=lambda b: (len(b.queue), -b.last_seen))
+        if preferred is not None:
+            return preferred                      # queue for when it reconnects
+        return candidates[0] if len(candidates) == 1 else None
+
+    def request_bind(self, name: str = "", note: str = "", instance: str = "") -> VirtualBind:
+        bind = VirtualBind(name or "agent", note=note, instance=instance)
         with self._lock:
             self._binds[bind.qrcode] = bind
         self._log(f"virtual: pending bind {bind.name} qrcode={bind.qrcode[:8]}…")
@@ -374,17 +456,19 @@ class VirtualILinkServer:
             self._persist()
         return removed
 
-    def ensure_bind(self, name: str, *, issued: bool = True) -> VirtualBind:
+    def ensure_bind(self, name: str, *, instance: str = "", issued: bool = True) -> VirtualBind:
         """Get (or create) a confirmed identity for a named agent.
 
         ``issued=True`` means "never hand this qrcode out to a fresh agent": used
         for identities that are reserved for a specific client (auto-approved
         agents and token-reuse agents).
         """
-        bind = self.bind_named(name)
-        if bind:
-            return bind
-        bind = self.request_bind(name)
+        with self._lock:
+            for bind in self._binds.values():
+                if (bind.name.lower() == name.lower() and bind.instance == instance
+                        and bind.confirmed and not bind.expired):
+                    return bind
+        bind = self.request_bind(name, instance=instance)
         if not bind.confirmed:
             self.approve(bind.qrcode, name=name)
         bind.qr_issued = issued
@@ -400,14 +484,18 @@ class VirtualILinkServer:
             bind = self._by_token.get(token)
         if bind:
             return bind
-        name = self.accept_tokens.get(token)
-        if not name:
+        identity = self.accept_tokens.get(token)
+        if not identity:
             return None
+        name, instance = identity
         # A client that is already bound to the real WeChat (its QR path may be
         # hard-wired to Tencent) keeps working through us: the token it already
         # holds is an alias for its virtual identity.
-        self._log(f"virtual: real token reused for agent {name}")
-        return self.ensure_bind(name, issued=True)
+        self._log(f"virtual: real token reused for agent {name}"
+                  + (f" instance {instance}" if instance else ""))
+        bind = self.ensure_bind(name, instance=instance, issued=True)
+        bind.last_seen = time.time()
+        return bind
 
     # -- stop requests ---------------------------------------------------
     def request_stop(self, peer: str, *, ttl: float = STOP_TTL_SECONDS) -> bool:
@@ -433,12 +521,12 @@ class VirtualILinkServer:
     # -- routing helpers -------------------------------------------------
     def deliver(self, agent: str, *, text: str, peer: str, message_id: str = "",
                 context_token: str = "") -> bool:
-        bind = self.bind_named(agent)
+        bind = self.pick_bind(agent, peer)
         if not bind:
             return False
         bind.deliver(text=text, peer=peer, message_id=message_id, context_token=context_token)
         self._persist()
-        self._log(f"virtual: -> {bind.name} {text[:60]!r}")
+        self._log(f"virtual: -> {bind.bind_id} {text[:60]!r}")
         return True
 
     def wait_for_bind(self, name: str, timeout: float = 120.0) -> Optional[VirtualBind]:
@@ -462,8 +550,8 @@ class VirtualILinkServer:
         # agents must not, so their qrcode is never handed out.
         for name in self.auto_approve:
             self.ensure_bind(name, issued=False)
-        for name in self.accept_tokens.values():
-            self.ensure_bind(name, issued=True)
+        for name, instance in self.accept_tokens.values():
+            self.ensure_bind(name, instance=instance, issued=True)
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="virtual-ilink",
                                         daemon=True)
         self._thread.start()
@@ -490,6 +578,10 @@ class VirtualILinkServer:
             address = ipaddress.ip_address((ip or "").strip("[]"))
         except ValueError:
             return False
+        mapped = getattr(address, "ipv4_mapped", None)
+        if mapped is not None:
+            address = mapped      # ::ffff:192.0.2.1 is that IPv4 address
+
         for entry in cidrs or []:
             try:
                 network = ipaddress.ip_network(str(entry).strip(), strict=False)
@@ -606,7 +698,7 @@ class VirtualILinkServer:
                     "errmsg": "远程接入需要 bind_key：请在取码请求里带上 ?key=…"}
         bind = self.pending_qr()
         return {"ret": RET_OK, "qrcode": bind.qrcode,
-                "qrcode_img_content": f"{self.base_url()}/bind/{bind.qrcode}"}
+                "qrcode_img_content": f"{self.public_base()}/bind/{bind.qrcode}"}
 
     def ep_qrcode_status(self, qrcode: str) -> Dict[str, Any]:
         with self._lock:
@@ -618,7 +710,7 @@ class VirtualILinkServer:
         if not bind.confirmed:
             return {"ret": RET_OK, "status": "wait"}
         return {"ret": RET_OK, "status": "confirmed", "ilink_bot_id": bind.account_id,
-                "bot_token": bind.token, "baseurl": self.base_url(), "ilink_user_id": bind.name}
+                "bot_token": bind.token, "baseurl": self.public_base(), "ilink_user_id": bind.name}
 
     def ep_getupdates(self, bind: VirtualBind, payload: Dict[str, Any],
                       timeout: float = LONG_POLL_SECONDS) -> Dict[str, Any]:
@@ -640,6 +732,15 @@ class VirtualILinkServer:
             elif media.parse_media_item(item):
                 media_items.append(item)
 
+        bind.last_seen = time.time()
+        if bind.last_peer:
+            # This device answered the chat: keep the conversation on it while it
+            # stays connected (see pick_bind).
+            with self._lock:
+                changed = self._peer_bind.get(bind.last_peer) != bind.bind_id
+                self._peer_bind[bind.last_peer] = bind.bind_id
+            if changed:
+                self._persist()
         handled = False
         if text.strip() and self.on_outbound:
             self.on_outbound(bind, text)

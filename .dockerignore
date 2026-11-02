@@ -1,0 +1,13 @@
+# Keep the image small and secrets out. data/ and config/ are mounted at runtime.
+.git
+.gitignore
+data
+config
+*.md
+!README.md
+tests
+watchdog
+desktop
+__pycache__
+*.pyc
+.DS_Store

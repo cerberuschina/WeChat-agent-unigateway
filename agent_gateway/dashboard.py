@@ -133,14 +133,34 @@ function render(s) {
         <button class="ghost" onclick="decide('${esc(p.qrcode)}', false)">拒绝</button></div></td>
     </tr>`).join("")}</table>` : '<span class="mut">没有待批准的请求。</span>';
 
-  $("agents").innerHTML = (g.agents||[]).length ? `<table><tr><th>名字</th><th>类型</th><th>状态</th><th>虚拟号</th><th>队列</th><th>最后活动</th></tr>${
-    (g.agents||[]).map(a => `<tr>
-      <td>${esc(a.label || a.name)}</td><td class="mut">${esc(a.type)}</td>
-      <td><span class="pill ${a.bound ? "ok" : (a.type === "virtual" ? "wait" : "ok")}">${a.bound ? "已接入" : (a.type === "virtual" ? "未接入" : "就绪")}</span></td>
-      <td class="mono mut">${esc(a.account_id || "—")}</td>
-      <td>${a.queue ?? 0}</td>
-      <td class="mut">${a.last_seen ? ago(a.last_seen) + " 前" : "—"}</td>
-    </tr>`).join("")}</table>` : "—";
+  const agentRows = [];
+  for (const a of (g.agents||[])) {
+    const insts = (a.instances || []).filter(i => i.bind_id);
+    if (!insts.length) {
+      agentRows.push(`<tr>
+        <td>${esc(a.label || a.name)}</td><td class="mut">${esc(a.type)}</td>
+        <td><span class="pill ${a.bound ? "ok" : (a.type === "virtual" ? "wait" : "ok")}">${a.bound ? "已接入" : (a.type === "virtual" ? "未接入" : "就绪")}</span></td>
+        <td class="mono mut">${esc(a.account_id || "—")}</td>
+        <td>${a.queue ?? 0}</td>
+        <td class="mut">${a.last_seen ? ago(a.last_seen) + " 前" : "—"}</td>
+      </tr>`);
+      continue;
+    }
+    // 一台设备一行：同一个 agent 可以在多台机器上各跑一个实例。
+    for (const i of insts) {
+      agentRows.push(`<tr>
+        <td>${esc(a.label || a.name)} <span class="mono mut">${esc(i.bind_id)}</span></td>
+        <td class="mut">${esc(a.type)}</td>
+        <td><span class="pill ${i.online ? "ok" : "wait"}">${i.online ? "在线" : "离线"}</span></td>
+        <td class="mono mut">${esc(i.account_id || "—")}</td>
+        <td>${i.queue ?? 0}</td>
+        <td class="mut">${i.last_seen ? ago(i.last_seen) + " 前" : "—"}</td>
+      </tr>`);
+    }
+  }
+  $("agents").innerHTML = agentRows.length
+    ? `<table><tr><th>名字</th><th>类型</th><th>状态</th><th>虚拟号</th><th>队列</th><th>最后活动</th></tr>${agentRows.join("")}</table>`
+    : "—";
 
   const budget = d.per_peer || {};
   const keys = Object.keys(budget);

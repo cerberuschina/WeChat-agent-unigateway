@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
 
@@ -39,6 +40,15 @@ def read_token_source(source: str) -> str:
     if src.startswith("env:"):
         return os.environ.get(src[len("env:"):].strip(), "").strip()
     return src
+
+
+_INSTANCE_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+
+
+def split_identity(key: str) -> Tuple[str, str]:
+    """``hermes@mac-air`` -> ``("hermes", "mac-air")``; bare ``hermes`` -> ``("hermes", "")``."""
+    agent, _, instance = (key or "").strip().partition("@")
+    return agent.strip().lower(), instance.strip()
 
 
 def _resolve_token_source(source: str, base: Path) -> str:
@@ -174,6 +184,10 @@ class VirtualConfig:
     # neither re-point its QR login at us (WorkBuddy's QR path is hard-wired to
     # Tencent) nor hand over a real token. Without this the legacy slot above
     # would be the only way in, i.e. exactly one such agent per gateway.
+    # A key may name a *device instance* of an agent: ``hermes@mac-air``,
+    # ``claude@win59``. One agent may appear several times, each with its own
+    # token file, so several machines can run the same kind of agent at once.
+    # A key without ``@`` stays the single unnamed instance (the old meaning).
     accept_tokens: Dict[str, str] = field(default_factory=dict)
     # --- remote (non-local) agents ------------------------------------------
     # A pre-shared key a remote agent must present to get a QR at all. Empty =
@@ -193,7 +207,7 @@ class VirtualConfig:
         return (name or "").lower() in [n.lower() for n in self.auto_approve]
 
     def reuse_tokens(self, own_token: str = "") -> Dict[str, str]:
-        """token -> agent name: which already-issued tokens the virtual server accepts.
+        """token -> agent (or ``agent@instance``): the tokens the virtual server accepts.
 
         Two ways in, merged into one map: ``accept_tokens`` (per-agent sources,
         what ``join.py`` writes) and the legacy ``reuse_real_token_for`` slot
@@ -344,10 +358,16 @@ def load_config(path: str | os.PathLike[str]) -> Config:
     if virtual.reuse_real_token_for and virtual.reuse_real_token_for not in agents:
         raise ConfigError(
             f"virtual.reuse_real_token_for='{virtual.reuse_real_token_for}' is not a configured agent")
-    for token_agent in virtual.accept_tokens:
+    for token_key in virtual.accept_tokens:
+        token_agent, _, device = token_key.partition("@")
         if token_agent not in agents:
             raise ConfigError(
-                f"virtual.accept_tokens['{token_agent}'] is not a configured agent")
+                f"virtual.accept_tokens['{token_key}'] is not a configured agent"
+                + (f" (agent '{token_agent}')" if device else ""))
+        if token_key.endswith("@") or (device and not _INSTANCE_RE.match(device)):
+            raise ConfigError(
+                f"virtual.accept_tokens['{token_key}']: instance must be "
+                "letters, digits, '.', '_' or '-' after '@'")
 
     dashboard_raw = dict(raw.get("dashboard") or {})
     dashboard = DashboardConfig(

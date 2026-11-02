@@ -488,3 +488,39 @@ class SessionSwitchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EndpointFallbackTests(unittest.TestCase):
+    """One client, several routes to the same gateway (Tailscale / WireGuard / tunnel)."""
+
+    def _listening(self):
+        import socket
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        self.addCleanup(sock.close)
+        return f"http://127.0.0.1:{sock.getsockname()[1]}"
+
+    def test_a_comma_separated_base_url_becomes_an_ordered_set(self):
+        self.assertEqual(
+            client.parse_endpoints(
+                "http://100.64.0.5:18500, http://10.8.0.2:18500/",
+                "", ["http://100.64.0.5:18500", "http://127.0.0.1:18500"]),
+            ["http://100.64.0.5:18500", "http://10.8.0.2:18500", "http://127.0.0.1:18500"])
+
+    def test_the_first_route_that_answers_wins(self):
+        live = self._listening()
+        picked = client.pick_endpoint(["http://127.0.0.1:1", live])
+        self.assertEqual(picked, live)
+
+    def test_a_working_current_route_is_kept(self):
+        live = self._listening()
+        self.assertEqual(client.pick_endpoint([live], current=live), live)
+
+    def test_with_nothing_reachable_the_first_candidate_is_used_anyway(self):
+        self.assertEqual(client.pick_endpoint(["http://127.0.0.1:1"]), "http://127.0.0.1:1")
+
+    def test_reachability_is_a_plain_tcp_check(self):
+        live = self._listening()
+        self.assertTrue(client.endpoint_reachable(live))
+        self.assertFalse(client.endpoint_reachable("http://127.0.0.1:1", timeout=0.5))
