@@ -839,3 +839,356 @@ class GatewayMultiInstanceTests(unittest.TestCase):
                              ["hermes@mac-air", "hermes@win59"])
         finally:
             gateway.shutdown()
+
+
+class PerAgentStickinessTests(unittest.TestCase):
+    """粘性要按 (agent, 聊天) 记，不能只按聊天记。
+
+    同一个微信会话会同时用 /c、/h、…，只按聊天记的话，后回复的那个 agent 会把
+    整个会话"记住哪台设备"的映射覆盖掉，另一个 agent 就退化成按新鲜度随机选。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.server = VirtualILinkServer(data_dir=self.dir)
+        now = time.time()
+        self.hs = self.server.request_bind("hermes", instance="studio")
+        self.hw = self.server.request_bind("hermes", instance="win59")
+        self.cw = self.server.request_bind("claude", instance="win59")
+        for bind in (self.hs, self.hw, self.cw):
+            self.server.approve(bind.qrcode)
+            bind.last_seen = now
+
+    def tearDown(self):
+        self.server.stop()
+        self._tmp.cleanup()
+
+    def _answer(self, bind, text="ok"):
+        bind.last_seen = time.time()
+        self.server.ep_sendmessage(bind, {"msg": {"item_list": [
+            {"type": 1, "text_item": {"text": text}}]}})
+
+    def test_one_agents_reply_does_not_hijack_another(self):
+        peer = "wx-1"
+        bind = self.server.deliver("hermes", text="hi", peer=peer)
+        self.assertEqual(bind.bind_id, self.hs.bind_id, "平手时按登记顺序取第一个")
+        self._answer(bind)
+        # win59 更"新鲜"，但这个会话已经粘在 studio 上
+        self.hw.last_seen = time.time() + 5
+        self.assertEqual(self.server.pick_bind("hermes", peer).bind_id, self.hs.bind_id)
+        # 另一个 agent 的粘性不受影响
+        self.assertEqual(self.server.pick_bind("claude", peer).bind_id, self.cw.bind_id)
+
+    def test_a_fresher_device_only_wins_for_chats_it_has_not_seen(self):
+        peer = "wx-1"
+        bind = self.server.deliver("hermes", text="hi", peer=peer)
+        self._answer(bind)
+        self.hw.last_seen = time.time() + 5
+        self.assertEqual(self.server.pick_bind("hermes", "wx-other").bind_id,
+                         self.hw.bind_id)
+
+    def test_stickiness_is_persisted_per_agent_and_survives_a_restart(self):
+        peer = "wx-1"
+        bind = self.server.deliver("hermes", text="hi", peer=peer)
+        self._answer(bind)
+        state = json.loads((self.dir / "binds.json").read_text(encoding="utf-8"))
+        self.assertIn(f"hermes|{peer}", state["peers"])
+        self.assertEqual(state["peers"][f"hermes|{peer}"], self.hs.bind_id)
+        self.server.stop()
+        self.server = VirtualILinkServer(data_dir=self.dir)
+        self.assertEqual(self.server.pick_bind("hermes", peer).bind_id, self.hs.bind_id)
+
+
+class UpstreamAskTests(unittest.TestCase):
+    """子网关模式：本地网关替 agent 收活，回答截住交给上游，而不是发进微信。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.forwarded = []
+        self.server = VirtualILinkServer(
+            data_dir=Path(self._tmp.name), auto_approve=["hermes"],
+            on_outbound=lambda bind, text: self.forwarded.append(text))
+        self.bind = self.server.request_bind("hermes")
+        self.bind.last_seen = time.time()
+
+    def tearDown(self):
+        self.server.stop()
+        self._tmp.cleanup()
+
+    def test_ask_round_trips_and_never_reaches_the_local_wechat(self):
+        result = {}
+
+        def ask():
+            result["reply"] = self.server.ask_agent("hermes", "你好", timeout=5)
+
+        thread = threading.Thread(target=ask, daemon=True)
+        thread.start()
+        messages = []
+        deadline = time.time() + 5
+        while time.time() < deadline and not messages:
+            _, messages = self.bind.drain("", timeout=0.2)
+        self.assertTrue(messages, "消息应该进到本地 bind 的队列")
+        self.assertEqual(messages[0]["item_list"][0]["text_item"]["text"], "你好")
+        self.server.ep_sendmessage(self.bind, {"msg": {"item_list": [
+            {"type": 1, "text_item": {"text": "回答"}}]}})
+        thread.join(5)
+        self.assertEqual(result.get("reply"), "回答")
+        self.assertEqual(self.forwarded, [], "上游来的问答不该发进本地微信")
+
+    def test_streaming_forwards_every_message_until_the_agent_goes_quiet(self):
+        got = []
+        result = {}
+
+        def ask():
+            result["first"] = self.server.ask_agent(
+                "hermes", "分几段说", timeout=5, idle=0.5, on_reply=got.append)
+
+        thread = threading.Thread(target=ask, daemon=True)
+        thread.start()
+        messages = []
+        deadline = time.time() + 5
+        while time.time() < deadline and not messages:
+            _, messages = self.bind.drain("", timeout=0.2)
+        self.assertTrue(messages)
+        for text in ("第一段", "第二段"):
+            self.server.ep_sendmessage(self.bind, {"msg": {"item_list": [
+                {"type": 1, "text_item": {"text": text}}]}})
+            time.sleep(0.1)
+        thread.join(5)
+        self.assertEqual(got, ["第一段", "第二段"], "每条回复都要转给上游")
+        self.assertEqual(result.get("first"), "第一段")
+
+    def test_an_orphan_upstream_reply_never_reaches_the_local_wechat(self):
+        # agent 一轮结束后又补发的消息：等待方已经没了，也不能发进本地微信。
+        self.bind.last_peer = "up:bridge:ghost"
+        result = self.server.ep_sendmessage(self.bind, {"msg": {"item_list": [
+            {"type": 1, "text_item": {"text": "迟到的回复"}}]}})
+        self.assertEqual(result["status"], "upstream")
+        self.assertEqual(self.forwarded, [])
+
+    def test_ask_without_a_connected_device_is_an_error(self):
+        with self.assertRaises(LookupError):
+            self.server.ask_agent("nobody", "x", timeout=1)
+
+    def test_ask_times_out_when_the_agent_stays_silent(self):
+        with self.assertRaises(TimeoutError):
+            self.server.ask_agent("hermes", "没人回答", timeout=0.5)
+
+
+class UpstreamConfigTests(unittest.TestCase):
+    def _load(self, upstream):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "gateway.json"
+        path.write_text(json.dumps({
+            "data_dir": "data",
+            "agents": {"hermes": {"type": "virtual", "prefix": "h"}},
+            "virtual": {"enabled": True},
+            "upstream": upstream,
+        }), encoding="utf-8")
+        return load_config(path)
+
+    def test_parsed(self):
+        cfg = self._load({"enabled": True, "device": "win59",
+                          "base_url": "http://100.112.180.63:18500/",
+                          "agents": {"Hermes": "tok"}})
+        self.assertTrue(cfg.upstream.enabled)
+        self.assertEqual(cfg.upstream.base_url, "http://100.112.180.63:18500")
+        self.assertEqual(cfg.upstream.agents, {"hermes": "tok"})
+
+    def test_missing_base_url_is_an_error(self):
+        with self.assertRaises(ConfigError):
+            self._load({"enabled": True, "agents": {"hermes": "tok"}})
+
+    def test_agent_must_exist_locally(self):
+        with self.assertRaises(ConfigError):
+            self._load({"enabled": True, "base_url": "http://x",
+                        "agents": {"nope": "tok"}})
+
+
+class AgentOnlineReportTests(unittest.TestCase):
+    """A sub-gateway polls for an agent that may be down; its poll says which."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.server = VirtualILinkServer(data_dir=Path(self._tmp.name),
+                                         accept_tokens={"tok": "claude@win59"})
+        self.host, self.port = self.server.start()
+
+    def tearDown(self):
+        self.server.stop()
+        self._tmp.cleanup()
+
+    def test_the_poll_remembers_what_the_device_reported(self):
+        bind = self.server._bind_for_token("tok")
+        self.assertIsNone(bind.agent_online, "没说就是不知道，不能当成离线")
+        self.server.ep_getupdates(bind, {"get_updates_buf": "", "agent_online": False}, timeout=0)
+        self.assertIs(bind.agent_online, False)
+        self.server.ep_getupdates(bind, {"get_updates_buf": "", "agent_online": True}, timeout=0)
+        self.assertIs(bind.agent_online, True)
+        self.assertIn("agent_online", bind.as_dict())
+
+    def test_a_poll_without_the_field_leaves_the_last_answer_alone(self):
+        bind = self.server._bind_for_token("tok")
+        self.server.ep_getupdates(bind, {"get_updates_buf": "", "agent_online": False}, timeout=0)
+        self.server.ep_getupdates(bind, {"get_updates_buf": ""}, timeout=0)
+        self.assertIs(bind.agent_online, False)
+
+    def test_the_poll_says_whether_it_can_wake_the_agent(self):
+        bind = self.server._bind_for_token("tok")
+        self.server.ep_getupdates(bind, {"get_updates_buf": "", "agent_wake": True}, timeout=0)
+        self.assertIs(bind.agent_wake, True)
+        self.assertIn("agent_wake", bind.as_dict())
+
+
+class WakeOnOfflineTests(unittest.TestCase):
+    """ask_agent wakes a local agent instead of queueing into a void."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.server = VirtualILinkServer(data_dir=Path(self._tmp.name),
+                                         accept_tokens={"tok": "claude@win59"})
+        self.host, self.port = self.server.start()
+        self.bind = self.server._bind_for_token("tok")
+        self.bind.last_seen = time.time() - 10_000       # it stopped polling
+
+    def tearDown(self):
+        self.server.stop()
+        self._tmp.cleanup()
+
+    def test_an_agent_that_cannot_be_woken_fails_fast_and_drops_the_message(self):
+        called = []
+        with self.assertRaises(TimeoutError) as ctx:
+            self.server.ask_agent("claude", "在吗", timeout=5, peer="up:bridge:claude",
+                                  ensure_online=lambda: called.append(1) or False)
+        self.assertEqual(called, [1], "离线时必须先尝试唤醒")
+        self.assertIn("唤醒", str(ctx.exception))
+        self.assertEqual(len(self.bind.queue), 0,
+                         "叫不醒就不能把消息留着，免得它以后无人值守地跑一遍")
+
+    def test_a_woken_agent_gets_the_message_and_answers(self):
+        def wake() -> bool:
+            self.bind.last_seen = time.time()
+            return True
+
+        def answer() -> None:
+            time.sleep(0.2)
+            self.server.ep_sendmessage(self.bind, {"msg": {"item_list": [
+                {"type": 1, "text_item": {"text": "来了"}}]}})
+
+        threading.Thread(target=answer, daemon=True).start()
+        got = self.server.ask_agent("claude", "在吗", timeout=5,
+                                    peer="up:bridge:claude", ensure_online=wake)
+        self.assertEqual(got, "来了")
+
+    def test_an_online_agent_is_never_woken(self):
+        self.bind.last_seen = time.time()
+        called = []
+        with self.assertRaises(TimeoutError):
+            self.server.ask_agent("claude", "在吗", timeout=0.2,
+                                  ensure_online=lambda: called.append(1) or True)
+        self.assertEqual(called, [])
+
+
+class OfflineAckTests(unittest.TestCase):
+    """The chat hears which device is down instead of a blanket 已转发."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _gateway(self, *, accept_tokens=None, wake=None) -> Gateway:
+        path = self.tmp / "gateway.json"
+        cfg = {
+            "data_dir": str(self.tmp / "data"),
+            "default_agent": "claude",
+            "dashboard": {"enabled": False},
+            "delivery": {"ack_template": "已转给 {label}", "offline_template": "「{label}」不在线，正在唤醒",
+                         "offline_plain_template": "「{label}」不在线，已排队"},
+            "virtual": {"enabled": True, "port": 0, "auto_approve": ["claude"]},
+            "agents": {"claude": {"type": "virtual", "label": "Claude Code"}},
+        }
+        if accept_tokens:
+            cfg["virtual"].pop("auto_approve")
+            cfg["virtual"]["accept_tokens"] = accept_tokens
+        if wake:
+            cfg["agents"]["claude"]["wake"] = wake
+        path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        gateway = Gateway(load_config(path))
+        self.addCleanup(gateway.shutdown)
+        gateway._start_virtual()
+        self.sent: list = []
+        gateway._send = lambda chat_id, text: self.sent.append(text)
+        return gateway
+
+    def _say(self, gateway: Gateway, text: str = "在吗") -> None:
+        gateway.handle({"from_user_id": "wx-user", "message_id": "m1",
+                        "item_list": [{"type": 1, "text_item": {"text": text}}]})
+
+    def test_a_live_local_agent_gets_the_normal_ack(self):
+        gateway = self._gateway()
+        self._say(gateway)
+        self.assertEqual(self.sent, ["已转给 Claude Code"])
+
+    def test_a_dead_local_agent_that_can_be_woken_gets_the_wake_reply(self):
+        gateway = self._gateway(wake={"command": "echo noop", "timeout": 0.1})
+        bind = gateway.virtual.bind_named("claude")
+        bind.last_seen = time.time() - 10_000
+        self._say(gateway)
+        self.assertEqual(self.sent, ["「Claude Code」不在线，正在唤醒"])
+
+    def test_a_dead_local_agent_without_a_wake_command_is_told_the_truth(self):
+        gateway = self._gateway()
+        bind = gateway.virtual.bind_named("claude")
+        bind.last_seen = time.time() - 10_000
+        self._say(gateway)
+        self.assertEqual(self.sent, ["「Claude Code」不在线，已排队"])
+
+    def test_a_bridge_that_can_wake_reports_waking_instead_of_forwarded(self):
+        gateway = self._gateway(accept_tokens={"claude@win59": "tok"})
+        bind = gateway.virtual._bind_for_token("tok")
+        bind.agent_online = False
+        bind.agent_wake = True
+        self._say(gateway)
+        self.assertEqual(self.sent, ["「Claude Code @ win59」不在线，正在唤醒"])
+
+    def test_a_bridge_that_cannot_wake_does_not_promise_a_wake(self):
+        gateway = self._gateway(accept_tokens={"claude@win59": "tok"})
+        bind = gateway.virtual._bind_for_token("tok")
+        bind.agent_online = False
+        bind.agent_wake = False
+        self._say(gateway)
+        self.assertEqual(self.sent, ["「Claude Code @ win59」不在线，已排队"])
+
+
+class WakeConfigTests(unittest.TestCase):
+    def _load(self, wake):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "gateway.json"
+        path.write_text(json.dumps({
+            "data_dir": "data",
+            "agents": {"claude": {"type": "virtual", "wake": wake}},
+            "virtual": {"enabled": True},
+        }), encoding="utf-8")
+        return load_config(path)
+
+    def test_wake_is_parsed(self):
+        cfg = self._load({"command": "start_it.cmd", "cwd": "C:/gw", "timeout": 30,
+                          "cooldown": 90})
+        wake = cfg.agent("claude").wake
+        self.assertTrue(wake.enabled)
+        self.assertEqual((wake.command, wake.cwd, wake.timeout, wake.cooldown),
+                         ("start_it.cmd", "C:/gw", 30.0, 90.0))
+
+    def test_no_wake_means_no_wake(self):
+        cfg = self._load({})
+        self.assertFalse(cfg.agent("claude").wake.enabled)
+
+    def test_an_unknown_wake_key_is_refused(self):
+        with self.assertRaises(ConfigError):
+            self._load({"comand": "typo"})

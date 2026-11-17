@@ -177,6 +177,39 @@ python -m agent_gateway --config gateway.json
 }
 ```
 
+### 子网关（upstream）与离线唤醒
+
+主网关（云主机）持微信身份；子网关（如 win59）本机跑 agent，同时作为普通 iLink 客户端
+替它们长轮询主网关：
+
+```jsonc
+"upstream": {
+  "enabled": true, "device": "win59", "base_url": "http://<主网关>:18500",
+  "agents": { "claude": "<主网关给 claude@win59 的 token>", "hermes": "…" },
+  "timeout": 900, "idle": 120
+}
+```
+
+子网关每次轮询会附带 `agent_online` / `agent_wake`，主网关因此知道**设备背后的 agent**
+是不是真的在长轮询，而不只是“设备还在轮询”。目标实例报告离线时，主网关不再回“已转发”：
+
+- 对端能唤醒 → `「Claude Code @ win59」当前不在线，正在尝试唤醒并发送…`（`delivery.offline_template`）
+- 对端不能唤醒 → `…当前不在线，消息已排队，等它上线后送出。`（`delivery.offline_plain_template`）
+
+唤醒命令配在**本机**（子网关）的 agent 上；消息落到一个不在线的 agent 时启动它，并等
+`timeout` 秒看它的长轮询回来：
+
+```jsonc
+"agents": {
+  "claude": { "type": "virtual", "label": "Claude Code", "prefix": "c",
+              "wake": { "command": "C:\\Python314\\python.exe E:\\…\\start_agent_stack.py --client-only",
+                        "cwd": "E:\\…", "timeout": 90, "cooldown": 180 } }
+}
+```
+
+`cooldown` 防止坏命令被每条消息重试。叫不醒时这条消息会从队列撤回并立刻回一条明确失败——
+不留着等 agent 以后无人值守地跑一遍（那样的回答也没有人收）。
+
 ### 三种后端
 
 | type | 用途 | 必填 |

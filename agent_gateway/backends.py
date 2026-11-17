@@ -172,6 +172,33 @@ def call_exec(agent, text: str) -> str:
     return (completed.stdout or "").strip()
 
 
+def call_gateway(agent, text: str, *, context_id: str = "") -> str:
+    """Forward one message to another gateway's ``/federation/send`` entry.
+
+    The sub-gateway owns the agent (and its session); the hub only relays text.
+    ``peer`` is the WeChat conversation id without the ``wx:`` prefix, so the
+    sub-gateway can keep per-chat context the same way the hub does.
+    """
+    peer = context_id[3:] if context_id.startswith("wx:") else context_id
+    payload = {
+        "agent": agent.remote_agent or agent.name,
+        "text": text,
+        "peer": peer,
+        "context_id": context_id,
+        "source": "gateway",
+    }
+    data = _post_json(agent.url, payload, headers=dict(agent.headers or {}),
+                      token=agent.token, timeout=agent.timeout)
+    error = data.get("error")
+    if isinstance(error, dict):
+        raise BackendError(
+            f"子网关报错 {error.get('code')}：{error.get('message')}")
+    reply = data.get("reply")
+    if not isinstance(reply, str) or not reply.strip():
+        raise BackendError(f"子网关 {agent.display} 没有返回文本")
+    return reply.strip()
+
+
 def call_agent(agent, text: str, *, context_id: str = "") -> str:
     """Dispatch one message to one agent and return its reply text."""
     if not agent.enabled:
@@ -182,6 +209,8 @@ def call_agent(agent, text: str, *, context_id: str = "") -> str:
         return call_http(agent, text)
     if agent.type == "exec":
         return call_exec(agent, text)
+    if agent.type == "gateway":
+        return call_gateway(agent, text, context_id=context_id)
     raise BackendError(f"未知 backend 类型：{agent.type}")
 
 

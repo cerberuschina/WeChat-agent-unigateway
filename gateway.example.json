@@ -62,6 +62,8 @@
     "max_chars_per_message": 1800,
     "ack": true,
     "ack_template": "已转给 {label}，算完就回。",
+    "offline_template": "「{label}」当前不在线，正在尝试唤醒并发送…",
+    "offline_plain_template": "「{label}」当前不在线，消息已排队，等它上线后送出。",
     "error_template": "「{label}」这次没跑通：{error}",
     "queue_template": "队列里还有 {n} 条，按顺序回。"
   },

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import secrets
 import threading
 import time
@@ -78,6 +79,16 @@ def virtual_account_id(name: str) -> str:
     return f"virt-{safe or 'agent'}{secrets.token_hex(3)}@im.bot"
 
 
+def stick_key(agent: str, peer: str) -> str:
+    """Stickiness is per (agent, chat), not per chat.
+
+    One WeChat chat talks to several agents (``/c``, ``/h``, …). Keying the map
+    by the peer alone made the agents overwrite each other's device choice, so
+    whichever answered last hijacked the whole chat.
+    """
+    return f"{agent}|{peer}"
+
+
 class VirtualBind:
     """One agent's virtual WeChat identity."""
 
@@ -102,6 +113,12 @@ class VirtualBind:
         self.queue: deque = deque()
         self.context_tokens: Dict[str, str] = {}
         self.last_seen = time.time()
+        # A sub-gateway keeps polling on behalf of an agent that may be down.
+        # Its poll can report whether the agent behind it is really listening:
+        # None = no one said, True/False = what the device told us last. It also
+        # says whether it can wake that agent on its own.
+        self.agent_online: Optional[bool] = None
+        self.agent_wake: Optional[bool] = None
 
     # -- lifecycle -------------------------------------------------------
     @property
@@ -126,6 +143,8 @@ class VirtualBind:
             "instance": self.instance,
             "bind_id": self.bind_id,
             "online": self.online(),
+            "agent_online": self.agent_online,
+            "agent_wake": self.agent_wake,
             "note": self.note,
             "qrcode": self.qrcode,
             "account_id": self.account_id,
@@ -196,6 +215,19 @@ class VirtualBind:
                 "item_list": [{"type": 1, "text_item": {"text": text}}],
             })
             self.lock.notify_all()
+
+    def drop_last(self, peer: str) -> bool:
+        """Take back the most recent queued message for ``peer``.
+
+        Used when a bridge could not wake the agent behind it: leaving the
+        message queued would run it, unattended, whenever the agent finally
+        comes back — and its answer would have no one to go to.
+        """
+        with self.lock:
+            if self.queue and self.queue[-1].get("from_user_id") == peer:
+                self.queue.pop()
+                return True
+        return False
 
     def drain(self, cursor: str, timeout: float) -> Tuple[str, List[Dict[str, Any]]]:
         """Long-poll: wait for messages, then return everything queued."""
@@ -317,6 +349,9 @@ class VirtualILinkServer:
         # chat last, so the next message of the same conversation goes to it while
         # it is connected. Persisted with the binds: a restart must not reshuffle.
         self._peer_bind: Dict[str, str] = {}
+        # peer -> Queue: 「本地网关当上游客户端」用。发给 "up:<hex>" 的消息不是
+        # 真微信会话，agent 的回复在这里被截住、原路返回给上游，而不是发进微信。
+        self._up_waiters: Dict[str, "queue.Queue[str]"] = {}
         self._state_path = self.dir / "binds.json"
         self._load_state()
         self._httpd: Optional[ThreadingHTTPServer] = None
@@ -345,7 +380,10 @@ class VirtualILinkServer:
             restored += 1
         peers = raw.get("peers")
         if isinstance(peers, dict):
-            self._peer_bind = {str(k): str(v) for k, v in peers.items() if k and v}
+            # 旧文件按 peer 记（多 agent 会互相覆盖），新格式是 "agent|peer"；
+            # 旧条目丢掉，下一次该 agent 回复时会重新建立粘性。
+            self._peer_bind = {str(k): str(v) for k, v in peers.items()
+                               if k and v and "|" in str(k)}
         if restored:
             self._log(f"virtual: restored {restored} bind(s) from {self._state_path.name}")
 
@@ -410,7 +448,7 @@ class VirtualILinkServer:
         candidates = self.binds_named(name)
         if not candidates:
             return None
-        preferred_id = self._peer_bind.get(peer) if peer else ""
+        preferred_id = self._peer_bind.get(stick_key(name, peer)) if peer else ""
         preferred = next((b for b in candidates if b.bind_id == preferred_id), None)
         if preferred is not None and preferred.online():
             return preferred
@@ -534,15 +572,87 @@ class VirtualILinkServer:
         self._log(f"virtual: -> {bind.bind_id} {text[:60]!r}")
         return bind
 
+    def ask_agent(self, agent: str, text: str, *, timeout: float = 900.0,
+                  peer: str = "", idle: float = 120.0,
+                  on_reply: Optional[Callable[[str], None]] = None,
+                  ensure_online: Optional[Callable[[], bool]] = None) -> Optional[str]:
+        """把一条消息交给本机的 agent，把它的回答交回来（上游桥用）。
+
+        消息用 ``up:<hex>``（或调用方指定的稳定 peer）投递；agent 按正常的
+        sendmessage 回话，回复在 :meth:`ep_sendmessage` 里被截住放进队列，
+        既不会发进本地微信，也不会污染聊天粘性。
+
+        给 ``on_reply`` 时是"流式"的：agent 每发一条都回调一次，直到它安静
+        ``idle`` 秒（一轮结束）或总超时；返回值是第一条。不给时只等第一条，
+        适合一次性问答和测试。
+
+        ``ensure_online`` 在目标设备没在长轮询时被调用（子网关传"唤醒本机
+        agent"）；返回 False 表示叫不醒，这条消息会从队列撤回并立刻报错，
+        而不是让它以后无人值守地跑一遍、回答无处可送。
+        """
+        peer = peer or f"up:{secrets.token_hex(8)}"
+        inbox: "queue.Queue[str]" = queue.Queue()
+        with self._lock:
+            self._up_waiters[peer] = inbox
+        try:
+            bind = self.deliver(agent, text=text, peer=peer)
+            if bind is None:
+                raise LookupError(f"agent '{agent}' 没有接入的设备")
+            if not bind.online():
+                if ensure_online is None:
+                    self._log(f"upstream: {bind.bind_id} 不在线，消息先排队")
+                else:
+                    self._log(f"upstream: {bind.bind_id} 不在线，尝试唤醒")
+                    if not ensure_online():
+                        bind.drop_last(peer)
+                        raise TimeoutError(
+                            f"{agent} 不在线，自动唤醒没有成功，这条消息没有送出；请稍后再发一次")
+            if on_reply is None:
+                try:
+                    return inbox.get(timeout=timeout)
+                except queue.Empty as exc:
+                    raise TimeoutError(f"{agent} 在 {timeout:.0f}s 内没有回复") from exc
+            deadline = time.monotonic() + timeout
+            quiet_until: Optional[float] = None
+            first: Optional[str] = None
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    break
+                wait = deadline - now
+                if quiet_until is not None:
+                    wait = min(wait, max(0.0, quiet_until - now))
+                    if wait <= 0:
+                        break
+                try:
+                    message = inbox.get(timeout=wait)
+                except queue.Empty:
+                    if first is None:
+                        continue
+                    break
+                if first is None:
+                    first = message
+                quiet_until = time.monotonic() + idle
+                try:
+                    on_reply(message)
+                except Exception as exc:  # noqa: BLE001 - 单条转发失败不打断整轮
+                    self._log(f"upstream: 转发失败 {exc}")
+            if first is None:
+                raise TimeoutError(f"{agent} 在 {timeout:.0f}s 内没有回复")
+            return first
+        finally:
+            with self._lock:
+                self._up_waiters.pop(peer, None)
+
     def served_peers(self, bind: VirtualBind) -> set:
         """Chats this device has handled (for the memory API's peer check)."""
         peers = set(bind.context_tokens)
         if bind.last_peer:
             peers.add(bind.last_peer)
         with self._lock:
-            for peer, bind_id in self._peer_bind.items():
+            for key, bind_id in self._peer_bind.items():
                 if bind_id == bind.bind_id:
-                    peers.add(peer)
+                    peers.add(key.split("|", 1)[1] if "|" in key else key)
         return peers
 
     def wait_for_bind(self, name: str, timeout: float = 120.0) -> Optional[VirtualBind]:
@@ -730,6 +840,14 @@ class VirtualILinkServer:
 
     def ep_getupdates(self, bind: VirtualBind, payload: Dict[str, Any],
                       timeout: float = LONG_POLL_SECONDS) -> Dict[str, Any]:
+        reported = payload.get("agent_online")
+        if isinstance(reported, bool):
+            # A sub-gateway says whether the agent behind it is actually there;
+            # the router uses this to stop acking "已转发" at a dead client.
+            bind.agent_online = reported
+        wakeable = payload.get("agent_wake")
+        if isinstance(wakeable, bool):
+            bind.agent_wake = wakeable
         cursor, messages = bind.drain(str(payload.get("get_updates_buf") or ""), timeout)
         if messages:
             # The cursor moved, so the resume point is now worth a write.
@@ -749,14 +867,26 @@ class VirtualILinkServer:
                 media_items.append(item)
 
         bind.last_seen = time.time()
-        if bind.last_peer:
+        upstream = bool(bind.last_peer) and bind.last_peer.startswith("up:")
+        if bind.last_peer and not upstream:
             # This device answered the chat: keep the conversation on it while it
             # stays connected (see pick_bind).
             with self._lock:
-                changed = self._peer_bind.get(bind.last_peer) != bind.bind_id
-                self._peer_bind[bind.last_peer] = bind.bind_id
+                key = stick_key(bind.name, bind.last_peer)
+                changed = self._peer_bind.get(key) != bind.bind_id
+                self._peer_bind[key] = bind.bind_id
             if changed:
                 self._persist()
+        if upstream and text.strip():
+            # 上游桥发来的消息：回复只回上游。等待方可能已经因为空闲而被清掉
+            # （agent 一轮结束后又补发的消息），这时宁可丢掉也不能落到本地微信——
+            # 那个 "up:..." 不是真的微信会话，发过去会被腾讯以 ret=-3 拒掉。
+            waiter = self._up_waiters.get(bind.last_peer)
+            if waiter is not None:
+                waiter.put(text)
+            else:
+                self._log(f"virtual: 丢弃一条无归属的上游回复（{bind.bind_id}）")
+            return {"ret": RET_OK, "status": "upstream"}
         handled = False
         if text.strip() and self.on_outbound:
             self.on_outbound(bind, text)

@@ -20,12 +20,13 @@ import argparse
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from . import backends, ilink, ilink_media, markdown, media, memory, router
 from .config import Config, ConfigError, load_account, load_config, save_account
@@ -67,6 +68,12 @@ class Gateway:
         self.log_ring = None
         self.dashboard = None
         self.virtual: Optional[VirtualILinkServer] = None
+        # 子网关模式的后台线程（见 upstream 配置）：每个本地 agent 一个。
+        self._upstream_workers: List[threading.Thread] = []
+        # Waking a local agent that is down (agents.*.wake): last launch per
+        # agent, so a broken command is not re-run for every message.
+        self._wake_last: Dict[str, float] = {}
+        self._wake_lock = threading.Lock()
         # Questions an agent needs a human to answer. The broker lives here so the
         # phone, the console and the router all look at one list; silence expires
         # to *deny*, because an unanswered question is not permission.
@@ -419,6 +426,90 @@ class Gateway:
                 f"（gateway.json 的 virtual.accept_tokens），然后看 "
                 f"{self.virtual.base_url() if self.virtual else ''}/admin/binds")
 
+    def _agent_ready(self, bind) -> bool:
+        """Can this device take a message *now*?
+
+        A bind counts as reachable while it long-polls. A sub-gateway polls on
+        behalf of an agent that may itself be dead, so it reports ``agent_online``
+        on every poll; ``False`` means a message would sit in a queue nobody reads.
+        """
+        online = getattr(bind, "online", None)
+        if not callable(online):
+            return True          # a backend/test double that accepted the message
+        return online() and getattr(bind, "agent_online", None) is not False
+
+    def agent_can_wake(self, name: str) -> bool:
+        agent = self.cfg.agent(name)
+        wake = getattr(agent, "wake", None) if agent else None
+        return bool(wake and wake.enabled)
+
+    def wake_agent(self, name: str, *, wait: bool = True) -> bool:
+        """Bring a local agent's client back after a message found it offline.
+
+        Only agents configured with ``agents.<name>.wake.command`` can be woken;
+        the command is started detached and then the agent's long-poll is waited
+        for up to ``wake.timeout`` seconds. Returns whether it is online now.
+        """
+        if not self.virtual:
+            return False
+
+        def is_online() -> bool:
+            return any(b.online() for b in self.virtual.binds_named(name))
+
+        if is_online():
+            return True
+        agent = self.cfg.agent(name)
+        wake = getattr(agent, "wake", None) if agent else None
+        if not wake or not wake.enabled:
+            return False
+
+        now = time.monotonic()
+        with self._wake_lock:
+            launch = now - self._wake_last.get(name, 0.0) >= max(float(wake.cooldown), 0.0)
+            if launch:
+                self._wake_last[name] = now
+        if launch:
+            try:
+                self._launch_wake(name, wake)
+            except OSError as exc:  # noqa: BLE001 - a missing exe must not crash the bridge
+                log.warning("wake %s: 启动失败 %s", name, exc)
+                return False
+        if not wait:
+            return is_online()
+        deadline = time.monotonic() + max(float(wake.timeout), 0.0)
+        while time.monotonic() < deadline:
+            if is_online():
+                log.info("wake %s: 已上线", name)
+                return True
+            time.sleep(0.5)
+        log.warning("wake %s: %.0fs 内没有上线", name, float(wake.timeout))
+        return False
+
+    def _launch_wake(self, name: str, wake) -> None:
+        cwd = wake.cwd or (str(self.cfg.source.parent) if self.cfg.source else "")
+        log.warning("agent %s 不在线，正在唤醒：%s", name, wake.command)
+        kwargs = {}
+        if os.name == "nt":
+            # No console window and no tie to this process's console: the
+            # gateway is started hidden, and a flash of cmd.exe would be ugly.
+            kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED | NEW_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        log_path = Path(self.cfg.data_dir) / "wake.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        # `set X=1 && "quoted\path"` inside a shell= line trips cmd.exe's quote
+        # parsing; the child gets the same settings through its environment.
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        with open(log_path, "ab") as out:
+            out.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} wake {name}: "
+                      f"{wake.command}\n".encode("utf-8"))
+            out.flush()
+            subprocess.Popen(wake.command, shell=True, cwd=cwd or None, env=env,
+                             stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                             **kwargs)
+
     def _dispatch_virtual(self, agent, text: str, sender: str, message_id: str,
                           context_token: str, *, busy: str = "") -> None:
         if not self.virtual:
@@ -446,11 +537,36 @@ class Gateway:
         if not delivered:
             self._send(sender, self._virtual_unreachable(agent))
             return
-        self._memory_inbound(sender, agent.name,
-                             str(getattr(delivered, "instance", "") or ""), text)
+        instance = str(getattr(delivered, "instance", "") or "")
+        ready = self._agent_ready(delivered)
+        if not ready and not instance and hasattr(self.virtual, "binds_named"):
+            # A local agent that stopped polling: wake it in the background
+            # instead of making the user resend. The message already waits in
+            # its queue, so it runs as soon as the client is back.
+            threading.Thread(target=self.wake_agent, args=(agent.name,),
+                             kwargs={"wait": False}, name=f"wake-{agent.name}",
+                             daemon=True).start()
+        self._memory_inbound(sender, agent.name, instance, text)
         self._record("in", sender, agent.name, text)
+        log.info("virtual dispatch -> %s (instance=%s) from %s",
+                 agent.name, instance or "-", _safe(sender))
         if self.cfg.delivery.ack and not self.dry_run:
-            self._send(sender, self.cfg.delivery.ack_template.format(label=agent.display))
+            # 同一 agent 可以在多台设备上各跑一个实例；把落到哪台写进 ack，否则
+            # 用户看到的是同一个名字，分不清到底是哪台机器在回答。
+            label = f"{agent.display} @ {instance}" if instance else agent.display
+            if ready:
+                template = self.cfg.delivery.ack_template
+            elif instance:
+                # A bridge: trust what it last reported about its own agent.
+                template = (self.cfg.delivery.offline_template
+                            if getattr(delivered, "agent_online", None) is False
+                            and getattr(delivered, "agent_wake", None) is True
+                            else self.cfg.delivery.offline_plain_template)
+            else:
+                template = (self.cfg.delivery.offline_template
+                            if self.agent_can_wake(agent.name)
+                            else self.cfg.delivery.offline_plain_template)
+            self._send(sender, template.format(label=label))
         # The agent answers whenever it is done; hold 「正在输入」 until then.
         self._start_typing(sender)
 
@@ -466,6 +582,7 @@ class Gateway:
                  _safe(self.client.account_id), self.client.base_url,
                  ",".join(a.name for a in self.cfg.enabled_agents()))
         self._start_virtual()
+        self._start_upstream()
         failures = 0
         while not self._stop.is_set():
             started = time.monotonic()
@@ -549,6 +666,20 @@ class Gateway:
             state = f"已接入 {bind.account_id}" if bind else "还没接入（等它在自己那边发起扫码登录）"
             print(f"  · {agent.name:<10} {state}")
         self._start_dashboard()
+
+    def _start_upstream(self) -> None:
+        """子网关模式：替本地 agent 长轮询主网关（见 UpstreamConfig）。"""
+        up = self.cfg.upstream
+        if not up.enabled:
+            return
+        if not self.virtual:
+            log.warning("upstream: 需要先开 virtual 才能把本地 agent 借给主网关")
+            return
+        for agent, token in up.agents.items():
+            worker = _UpstreamWorker(self, agent, token)
+            worker.start()
+            self._upstream_workers.append(worker)
+            log.info("upstream: %s -> %s (device=%s)", agent, up.base_url, up.device or "-")
 
     def _memory_api(self, bind, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not self.memory or not self.memory.enabled:
@@ -710,6 +841,8 @@ class Gateway:
                 # One device per instance: the console shows which machines are
                 # connected, not just whether the agent name has any bind.
                 "instances": [{"bind_id": b.bind_id, "online": b.online(),
+                               "agent_online": b.agent_online,
+                               "agent_wake": b.agent_wake,
                                "queue": len(b.queue), "last_seen": b.last_seen,
                                "account_id": b.account_id}
                               for b in instances],
@@ -982,6 +1115,86 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true", help="process one long-poll batch, then exit")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
+
+
+class _UpstreamWorker(threading.Thread):
+    """把本机的一个 agent 借给主网关（子网关模式）。
+
+    对主网关来说它就是一个普通的 iLink 设备：用 token 长轮询、收消息、回消息。
+    区别在于消息不是丢给一个外部命令，而是塞进本机网关的 agent 队列——那个
+    agent 早就接在本地网关上，回复在这里被截住、原样送回主网关，而不是发进
+    本地微信。
+    """
+
+    def __init__(self, gateway: "Gateway", agent: str, token: str):
+        super().__init__(name=f"upstream-{agent}", daemon=True)
+        self.gateway = gateway
+        self.agent = agent
+        self.token = token
+        self.timeout = float(gateway.cfg.upstream.timeout or 900)
+        self.idle = float(gateway.cfg.upstream.idle or 120)
+        self.client = ilink.ILinkClient(
+            account_id=f"reuse-{agent}", token=token,
+            base_url=gateway.cfg.upstream.base_url,
+            data_dir=Path(gateway.cfg.data_dir) / "upstream" / agent)
+
+    def _local_online(self) -> bool:
+        """Is the local agent behind this bridge actually long-polling us?"""
+        virtual = self.gateway.virtual
+        if not virtual:
+            return False
+        return any(b.online() for b in virtual.binds_named(self.agent))
+
+    def run(self) -> None:
+        cursor = self.client.load_cursor()
+        backoff = 2.0
+        while not self.gateway._stop.is_set():
+            try:
+                # The main gateway only sees our poll; tell it whether the agent
+                # behind us is really there, so its ack can say "已转发" honestly.
+                response = self.client.get_updates(cursor, extra={
+                    "agent_online": self._local_online(),
+                    "agent_wake": self.gateway.agent_can_wake(self.agent)})
+            except ilink.SessionExpired:
+                log.error("upstream %s: 主网关不认这个 token，停止转发", self.agent)
+                return
+            except Exception as exc:  # noqa: BLE001 - 断线就退避重试
+                log.warning("upstream %s: %s", self.agent, exc)
+                time.sleep(backoff)
+                backoff = min(30.0, backoff * 2)
+                continue
+            backoff = 2.0
+            new_cursor = str(response.get("get_updates_buf") or "")
+            if new_cursor and new_cursor != cursor:
+                cursor = new_cursor
+                self.client.save_cursor(cursor)
+            for message in response.get("msgs") or []:
+                if isinstance(message, dict):
+                    self._handle(message)
+
+    def _handle(self, message: Dict[str, object]) -> None:
+        text = ""
+        for item in message.get("item_list") or []:   # type: ignore[union-attr]
+            if isinstance(item, dict) and item.get("type") == 1:
+                text += str((item.get("text_item") or {}).get("text") or "")
+        peer = str(message.get("from_user_id") or "")
+        if not text.strip() or not peer:
+            return
+        context_token = message.get("context_token") or None
+
+        def forward(chunk: str) -> None:
+            self.client.send_text(peer, chunk, context_token=context_token)
+
+        try:
+            self.gateway.virtual.ask_agent(
+                self.agent, text, timeout=self.timeout,
+                peer=f"up:bridge:{self.agent}", idle=self.idle, on_reply=forward,
+                ensure_online=lambda: self.gateway.wake_agent(self.agent))
+        except Exception as exc:  # noqa: BLE001 - 让主网关看到失败原因
+            try:
+                forward(f"「{self.agent}」这次没跑通：{exc}")
+            except Exception as send_exc:  # noqa: BLE001
+                log.warning("upstream %s: 回送失败 %s", self.agent, send_exc)
 
 
 def main(argv: Optional[list] = None) -> int:

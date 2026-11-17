@@ -80,6 +80,27 @@ class AccountConfig:
 
 
 @dataclass
+class WakeConfig:
+    """How to bring a local agent's client back when a message finds it offline.
+
+    The gateway cannot reach into another machine, so this only applies to
+    agents that run *here* (the sub-gateway case): ``command`` is started
+    detached, then the gateway waits up to ``timeout`` seconds for the agent's
+    long-poll to show up again. ``cooldown`` keeps a dead command from being
+    re-launched on every message.
+    """
+
+    command: str = ""
+    cwd: str = ""
+    timeout: float = 60.0
+    cooldown: float = 120.0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.command.strip())
+
+
+@dataclass
 class AgentConfig:
     """One backend agent.
 
@@ -87,6 +108,7 @@ class AgentConfig:
       - ``a2a``  — A2A JSON-RPC endpoint (any agent speaking the A2A protocol)
       - ``http`` — plain HTTP JSON endpoint
       - ``exec`` — a local command; the reply is its stdout
+      - ``gateway`` — another agent-gateway's ``/federation/send`` entry
     """
 
     name: str
@@ -95,6 +117,7 @@ class AgentConfig:
     prefix: str = ""
     url: str = ""
     token: str = ""
+    remote_agent: str = ""
     method: str = "POST"
     headers: Dict[str, str] = field(default_factory=dict)
     body_template: Optional[Dict[str, Any]] = None
@@ -103,6 +126,7 @@ class AgentConfig:
     cwd: str = ""
     timeout: float = 900.0
     enabled: bool = True
+    wake: WakeConfig = field(default_factory=WakeConfig)
 
     @property
     def display(self) -> str:
@@ -118,6 +142,13 @@ class DeliveryConfig:
     reserve_for_answer: int = 2
     ack: bool = True
     ack_template: str = "已转给 {label}，算完就回。"
+    # Sent instead of the ack when the gateway knows the device's agent is not
+    # listening (a sub-gateway reports its local agent is down). The device is
+    # being woken, so this is not an error — it is the truth about the wait.
+    offline_template: str = "「{label}」当前不在线，正在尝试唤醒并发送…"
+    # ...and when that device cannot wake the agent by itself: the message is
+    # kept until the agent comes back, but no wake is being attempted.
+    offline_plain_template: str = "「{label}」当前不在线，消息已排队，等它上线后送出。"
     error_template: str = "「{label}」这次没跑通：{error}"
     queue_template: str = "队列里还有 {n} 条，按顺序回。"
     # A "保活" ping is answered by the gateway itself — no agent, no model round
@@ -270,6 +301,24 @@ class MemoryConfig:
 
 
 @dataclass
+class UpstreamConfig:
+    """子网关模式：本机网关作为虚拟 iLink 客户端连到主网关。
+
+    本机的 agent（Hermes / Claude …）仍然接在**本机**网关上；这里再给每个
+    agent 一个主网关签发的 token，由本机网关替它们长轮询主网关、转发消息、
+    把 agent 的回答送回去。主网关那边看到的就是普通的设备实例，多设备粘住和
+    故障转移照常生效。
+    """
+
+    enabled: bool = False
+    device: str = ""
+    base_url: str = ""
+    agents: Dict[str, str] = field(default_factory=dict)   # 本地 agent 名 -> 主网关 token
+    timeout: float = 900.0
+    idle: float = 120.0   # agent 安静多久算这一轮结束（之后补发的消息会被丢弃）
+
+
+@dataclass
 class Config:
     account: AccountConfig
     agents: Dict[str, AgentConfig]
@@ -280,6 +329,7 @@ class Config:
     virtual: VirtualConfig = field(default_factory=VirtualConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    upstream: UpstreamConfig = field(default_factory=UpstreamConfig)
     source: Optional[Path] = None
 
     # -- lookups ---------------------------------------------------------
@@ -308,18 +358,33 @@ class Config:
 
 
 def _agent_from_dict(name: str, raw: Dict[str, Any]) -> AgentConfig:
+    raw = dict(raw)
+    wake_raw = raw.pop("wake", None)
+    if wake_raw is not None and not isinstance(wake_raw, dict):
+        raise ConfigError(f"agent '{name}': wake must be an object")
     known = {f for f in AgentConfig.__dataclass_fields__}  # type: ignore[attr-defined]
     unknown = set(raw) - known
     if unknown:
         raise ConfigError(f"agent '{name}': unknown key(s) {sorted(unknown)}")
+    if wake_raw:
+        unknown_wake = set(wake_raw) - {f for f in WakeConfig.__dataclass_fields__}
+        if unknown_wake:
+            raise ConfigError(f"agent '{name}': unknown wake key(s) {sorted(unknown_wake)}")
+        raw["wake"] = WakeConfig(command=str(wake_raw.get("command") or ""),
+                                 cwd=str(wake_raw.get("cwd") or ""),
+                                 timeout=float(wake_raw.get("timeout") or 60),
+                                 cooldown=float(wake_raw.get("cooldown")
+                                                if wake_raw.get("cooldown") is not None else 120))
     agent = AgentConfig(name=name.lower(), **raw)
     if agent.enabled and not agent.label:
         agent.label = name
-    if agent.enabled and agent.type not in {"a2a", "http", "exec", "virtual"}:
+    if agent.enabled and agent.type not in {"a2a", "http", "exec", "virtual", "gateway"}:
         raise ConfigError(
-            f"agent '{name}': type must be a2a|http|exec|virtual, got {agent.type!r}")
-    if agent.enabled and agent.type in {"a2a", "http"} and not agent.url:
+            f"agent '{name}': type must be a2a|http|exec|virtual|gateway, got {agent.type!r}")
+    if agent.enabled and agent.type in {"a2a", "http", "gateway"} and not agent.url:
         raise ConfigError(f"agent '{name}': type '{agent.type}' needs a url")
+    if agent.enabled and agent.type == "gateway" and not agent.token:
+        raise ConfigError(f"agent '{name}': type 'gateway' needs the sub-gateway's token")
     if agent.enabled and agent.type == "exec" and not agent.command:
         raise ConfigError(f"agent '{name}': type 'exec' needs a command list")
     return agent
@@ -427,6 +492,25 @@ def load_config(path: str | os.PathLike[str]) -> Config:
     if memory.rag_enabled:
         raise ConfigError("memory.rag.enabled 是 P2 的能力；现在请保持 false")
 
+    up_raw = dict(raw.get("upstream") or {})
+    upstream = UpstreamConfig(
+        enabled=bool(up_raw.get("enabled")),
+        device=str(up_raw.get("device") or ""),
+        base_url=str(up_raw.get("base_url") or "").rstrip("/"),
+        agents={str(k).strip().lower(): str(v).strip()
+                for k, v in (up_raw.get("agents") or {}).items()},
+        timeout=float(up_raw.get("timeout") or 900),
+        idle=float(up_raw.get("idle") or 120),
+    )
+    if upstream.enabled:
+        if not upstream.base_url:
+            raise ConfigError("upstream.enabled 需要 upstream.base_url（主网关的虚拟 iLink 地址）")
+        if not upstream.agents:
+            raise ConfigError("upstream.enabled 需要 upstream.agents（本地 agent → 主网关发的 token）")
+        missing = [a for a in upstream.agents if a not in agents]
+        if missing:
+            raise ConfigError(f"upstream.agents 里的 {', '.join(missing)} 不在 agents 里")
+
     cfg = Config(
         account=account,
         agents=agents,
@@ -437,6 +521,7 @@ def load_config(path: str | os.PathLike[str]) -> Config:
         virtual=virtual,
         dashboard=dashboard,
         memory=memory,
+        upstream=upstream,
         source=path,
     )
     if cfg.default_agent and cfg.default_agent not in cfg.agents:

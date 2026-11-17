@@ -360,17 +360,24 @@ class ILinkClient:
             self._log(f"warn: cannot persist cursor: {exc}")
 
     # -- calls -----------------------------------------------------------
-    def get_updates(self, cursor: str) -> Dict[str, Any]:
+    def get_updates(self, cursor: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """One long-poll round.
 
         Only an idle poll becomes an empty batch. ``ret = -14`` raises
         ``SessionExpired``, ``ret = -2`` raises ``RateLimited`` and other network
         errors raise ``ILinkError``, so the caller can re-login or back off instead
         of polling again at once.
+
+        ``extra`` adds fields to the body for a *virtual* peer (our own gateway):
+        a sub-gateway uses it to report whether the agent behind it is actually
+        listening. Tencent ignores what it does not know.
         """
+        body: Dict[str, Any] = {"get_updates_buf": cursor}
+        if extra:
+            body.update({k: v for k, v in extra.items() if k != "get_updates_buf"})
         try:
             data = _request("POST", self.base_url, EP_GET_UPDATES, token=self.token,
-                            payload={"get_updates_buf": cursor}, timeout_ms=LONG_POLL_TIMEOUT_MS)
+                            payload=body, timeout_ms=LONG_POLL_TIMEOUT_MS)
         except PollIdle:
             return {"ret": 0, "msgs": [], "get_updates_buf": cursor}
         return _raise_for_status(data, "getupdates")
