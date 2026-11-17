@@ -73,5 +73,18 @@
     "enabled": true,
     "host": "127.0.0.1",
     "port": 18600
-  }
+  },
+
+  "memory": {
+    "enabled": true,
+    "backend": "builtin",
+    "data_dir": "/app/data/memory",
+    "l0_ttl_days": 30,
+    "inject": {"enabled": true, "max_chars": 800, "recent_turns": 4, "facts": 6},
+    "global_writers": ["claude@mac-air"],
+    "_global_writers": "允许写全局公共层的设备；微信里 /remember --global 不受它限制。",
+    "redact_patterns": []
+  },
+
+  "_memory": "统一记忆（docs/MEMORY.md）：记忆属于聊天，换设备/换 agent 读到同一份。P1 是内置 SQLite + Markdown，不依赖外部服务；TencentDB-Agent-Memory 后端在 P3（见 docs/MEMORY-DESIGN.md）。"
 }

@@ -247,6 +247,29 @@ class DashboardConfig:
 
 
 @dataclass
+class MemoryConfig:
+    """统一记忆（docs/MEMORY-DESIGN.md）。
+
+    P1 只实现内置后端：SQLite + FTS5 + Markdown 镜像。``rag`` 与
+    ``extractor`` 的配置在这里保留形状，P2 才真正使用。
+    """
+
+    enabled: bool = False
+    backend: str = "builtin"
+    data_dir: str = ""             # 默认 <data_dir>/memory
+    salt: str = ""                 # 空 = data_dir/memory/salt.txt（首次生成 0600）
+    l0_ttl_days: float = 30.0
+    inject_enabled: bool = True
+    inject_max_chars: int = 800
+    inject_recent_turns: int = 4
+    inject_facts: int = 6
+    global_writers: List[str] = field(default_factory=list)   # 允许写全局层的设备（agent@device）
+    redact_patterns: List[str] = field(default_factory=list)
+    rag_enabled: bool = False
+    extractor_url: str = ""
+
+
+@dataclass
 class Config:
     account: AccountConfig
     agents: Dict[str, AgentConfig]
@@ -256,6 +279,7 @@ class Config:
     access: AccessConfig = field(default_factory=AccessConfig)
     virtual: VirtualConfig = field(default_factory=VirtualConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     source: Optional[Path] = None
 
     # -- lookups ---------------------------------------------------------
@@ -376,6 +400,33 @@ def load_config(path: str | os.PathLike[str]) -> Config:
         port=int(dashboard_raw["port"]) if "port" in dashboard_raw else 18600,
     )
 
+    memory_raw = dict(raw.get("memory") or {})
+    inject_raw = dict(memory_raw.get("inject") or {})
+    rag_raw = dict(memory_raw.get("rag") or {})
+    extractor_raw = dict(memory_raw.get("extractor") or {})
+    memory = MemoryConfig(
+        enabled=bool(memory_raw.get("enabled", False)),
+        backend=str(memory_raw.get("backend") or "builtin").lower(),
+        data_dir=str(memory_raw.get("data_dir") or ""),
+        salt=_resolve_token_source(str(memory_raw.get("salt") or ""), root)
+        if str(memory_raw.get("salt") or "").startswith("file:") else str(memory_raw.get("salt") or ""),
+        l0_ttl_days=float(memory_raw.get("l0_ttl_days", 30) or 0),
+        inject_enabled=bool(inject_raw.get("enabled", True)),
+        inject_max_chars=int(inject_raw.get("max_chars", 800)),
+        inject_recent_turns=int(inject_raw.get("recent_turns", 4)),
+        inject_facts=int(inject_raw.get("facts", 6)),
+        global_writers=[str(x).lower() for x in (memory_raw.get("global_writers") or [])],
+        redact_patterns=[str(x) for x in (memory_raw.get("redact_patterns") or [])],
+        rag_enabled=bool(rag_raw.get("enabled", False)),
+        extractor_url=str(extractor_raw.get("url") or ""),
+    )
+    if memory.backend not in ("builtin",):
+        raise ConfigError(
+            f"memory.backend='{memory.backend}' 还没实现；P1 只有 'builtin'"
+            f"（TencentDB-Agent-Memory 后端在 docs/MEMORY-DESIGN.md 的 P3）")
+    if memory.rag_enabled:
+        raise ConfigError("memory.rag.enabled 是 P2 的能力；现在请保持 false")
+
     cfg = Config(
         account=account,
         agents=agents,
@@ -385,6 +436,7 @@ def load_config(path: str | os.PathLike[str]) -> Config:
         access=access,
         virtual=virtual,
         dashboard=dashboard,
+        memory=memory,
         source=path,
     )
     if cfg.default_agent and cfg.default_agent not in cfg.agents:

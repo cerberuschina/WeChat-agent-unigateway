@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Optional
 
-from . import backends, ilink, ilink_media, markdown, media, router
+from . import backends, ilink, ilink_media, markdown, media, memory, router
 from .config import Config, ConfigError, load_account, load_config, save_account
 from .store import StateStore
 from .virtual_ilink import VirtualILinkServer
@@ -47,6 +47,10 @@ class Gateway:
         self.dry_run = dry_run
         self.account_file = Path(account_file) if account_file else (cfg.data_dir / ACCOUNT_FILE)
         self.store = StateStore(cfg.data_dir / "state")
+        # Unified memory: belongs to the chat, shared by every device/agent
+        # (docs/MEMORY-DESIGN.md). Off by default; failures never block a message.
+        self.memory = memory.MemoryHub(cfg.memory, cfg.data_dir, log=log) if cfg.memory.enabled \
+            else None
         self.client: Optional[ilink.ILinkClient] = None
         self._chat_locks: Dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
@@ -356,6 +360,10 @@ class Gateway:
             self._request_stop(sender)
             return
 
+        if decision.kind in ("remember", "recall", "forget", "memory", "task"):
+            self._send(sender, self._memory_command(sender, decision))
+            return
+
         if decision.kind in ("new", "sessions", "resume"):
             self._forward_session_command(sender, decision, message_id=message_id,
                                           context_token=context_token)
@@ -375,12 +383,14 @@ class Gateway:
                                    busy=str(decision.metadata.get("busy") or ""))
             return
 
+        prompt = self._memory_inject(sender, decision.text)
+        self._memory_inbound(sender, agent.name, "", decision.text)
         with self._chat_lock(sender):
             if self.cfg.delivery.ack and not self.dry_run:
                 self._send(sender, self.cfg.delivery.ack_template.format(label=agent.display))
             self._typing(sender, ilink.TYPING_START)
             try:
-                reply = backends.call_agent(agent, decision.text, context_id=f"wx:{sender}")
+                reply = backends.call_agent(agent, prompt, context_id=f"wx:{sender}")
             except backends.BackendError as exc:
                 self._send(sender, self.cfg.delivery.error_template.format(label=agent.display, error=exc))
                 return
@@ -394,6 +404,7 @@ class Gateway:
                 self._typing(sender, ilink.TYPING_STOP)
             if not reply.strip():
                 reply = f"「{agent.display}」没有返回任何内容。"
+            self._memory_reply(sender, agent.name, "", reply)
             self._send(sender, reply)
 
     def _virtual_unreachable(self, agent) -> str:
@@ -429,11 +440,14 @@ class Gateway:
                 log.info("busy=steer: handing this to the running session for %s", _safe(sender))
                 self._send(sender, f"📨 插进「{agent.display}」正在做的那一轮了，"
                                    f"它这一步结束就照办。")
-        delivered = self.virtual.deliver(agent.name, text=text, peer=sender,
+        prompt = self._memory_inject(sender, text)
+        delivered = self.virtual.deliver(agent.name, text=prompt, peer=sender,
                                         message_id=message_id, context_token=context_token)
         if not delivered:
             self._send(sender, self._virtual_unreachable(agent))
             return
+        self._memory_inbound(sender, agent.name,
+                             str(getattr(delivered, "instance", "") or ""), text)
         self._record("in", sender, agent.name, text)
         if self.cfg.delivery.ack and not self.dry_run:
             self._send(sender, self.cfg.delivery.ack_template.format(label=agent.display))
@@ -506,6 +520,7 @@ class Gateway:
             data_dir=self.cfg.data_dir / "virtual",
             auto_approve=self.cfg.virtual.auto_approve,
             accept_tokens=self.cfg.virtual.reuse_tokens(self.cfg.account.token),
+            on_memory=self._memory_api,
             on_outbound=self._forward_to_wechat,
             on_outbound_items=self._forward_media_to_wechat,
             on_get_upload_url=self._get_upload_url,
@@ -535,12 +550,70 @@ class Gateway:
             print(f"  · {agent.name:<10} {state}")
         self._start_dashboard()
 
+    def _memory_api(self, bind, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.memory or not self.memory.enabled:
+            return {"ret": -1, "errmsg": "memory is disabled"}
+        peer = str(payload.get("peer") or "").strip()
+        served = self.virtual.served_peers(bind) if self.virtual else set()
+        allowed = bool(peer) and peer in served
+        writers = [str(w).lower() for w in (self.cfg.memory.global_writers or [])]
+        can_global = bind.bind_id.lower() in writers
+        try:
+            return self.memory.api(path, allowed_peer=allowed, can_global=can_global,
+                                   payload=payload)
+        except Exception as exc:  # noqa: BLE001 - 记忆 API 出错不能拖垮请求
+            log.warning("memory api failed: %s", exc)
+            return {"ret": -1, "errmsg": f"memory error: {exc}"}
+
+    def _memory_inject(self, sender: str, text: str) -> str:
+        try:
+            return self.memory.inject(sender, text) if self.memory else text
+        except Exception as exc:  # noqa: BLE001 - 记忆坏了也不能吞消息
+            log.warning("memory inject failed: %s", exc)
+            return text
+
+    def _memory_inbound(self, sender: str, agent: str, instance: str, text: str) -> None:
+        try:
+            if self.memory:
+                self.memory.record_inbound(sender, agent, instance, text)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("memory inbound record failed: %s", exc)
+
+    def _memory_reply(self, sender: str, agent: str, instance: str, text: str) -> None:
+        try:
+            if self.memory:
+                self.memory.record_reply(sender, agent, instance, text)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("memory reply record failed: %s", exc)
+
+    def _memory_command(self, sender: str, decision) -> str:
+        if not self.memory or not self.memory.enabled:
+            return "记忆没有开启：在 gateway.json 里设 memory.enabled=true 后重启网关。"
+        kind, text = decision.kind, decision.text
+        global_ = bool((decision.metadata or {}).get("global"))
+        try:
+            if kind == "remember":
+                return self.memory.remember(sender, text, global_=global_)
+            if kind == "recall":
+                return self.memory.recall(sender, text)
+            if kind == "forget":
+                return self.memory.forget(sender, text)
+            if kind == "task":
+                return self.memory.task_command(sender, text)
+            if text.strip().lower() in ("reload", "重新加载", "刷新"):
+                return self.memory.reload(sender)
+            return self.memory.overview(sender)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("memory command failed: %s", exc)
+            return f"记忆操作出错了：{exc}"
+
     def _forward_to_wechat(self, bind, text: str) -> None:
         """A virtual agent answered: push it out through the real WeChat identity."""
         peer = bind.last_peer
         if not peer:
             log.warning("virtual agent %s answered %r before any peer was known", bind.name, text[:60])
             return
+        self._memory_reply(peer, bind.name, bind.instance, text)
         self._stop_typing(peer)
         log.info("virtual: %s -> wechat %s (%d chars)", bind.name, _safe(peer), len(text))
         self._send(peer, text)
@@ -887,6 +960,8 @@ class Gateway:
             self.virtual.stop()
         self._pool.shutdown(wait=False)
         self.store.flush()
+        if self.memory:
+            self.memory.close()
 
 
 def suggestion_prefix(decision: router.Decision) -> str:

@@ -68,5 +68,15 @@
 
   "access": {
     "allowed_users": []
+  },
+
+  "memory": {
+    "enabled": false,
+    "_enabled": "统一记忆：属于聊天而不是设备（docs/MEMORY.md）。打开后自动记对话与事实，并在每条消息前注入一段摘要；任何记忆故障都不影响收发。",
+    "backend": "builtin",
+    "l0_ttl_days": 30,
+    "inject": {"enabled": true, "max_chars": 800, "recent_turns": 4, "facts": 6},
+    "global_writers": [],
+    "_global_writers": "允许写全局公共层的设备（agent@device）；微信里的 /remember --global 不受它限制。"
   }
 }

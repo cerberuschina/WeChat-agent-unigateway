@@ -266,6 +266,7 @@ class VirtualILinkServer:
                  on_typing: Optional[Callable[[VirtualBind, int], None]] = None,
                  approvals: Optional[Any] = None,
                  on_approval: Optional[Callable[[VirtualBind, Any], None]] = None,
+                 on_memory: Optional[Callable[[VirtualBind, str, Dict[str, Any]], Dict[str, Any]]] = None,
                  bind_key: str = "", public_url: str = "",
                  allow_cidrs: Optional[List[str]] = None,
                  admin_cidrs: Optional[List[str]] = None,
@@ -294,6 +295,9 @@ class VirtualILinkServer:
         # gateway owns the broker, so the phone *and* the console see one list.
         self.approvals = approvals
         self.on_approval = on_approval
+        # Unified memory: the gateway owns the store; this just delivers the call
+        # with the already-authenticated bind (peer checks happen there).
+        self.on_memory = on_memory
         # Remote agents: a pre-shared bind key, and the address they should use to
         # fetch media they cannot read from this machine's disk.
         self.bind_key = bind_key or ""
@@ -520,14 +524,26 @@ class VirtualILinkServer:
 
     # -- routing helpers -------------------------------------------------
     def deliver(self, agent: str, *, text: str, peer: str, message_id: str = "",
-                context_token: str = "") -> bool:
+                context_token: str = "") -> Optional[VirtualBind]:
+        """Queue one message for this agent; returns the device instance it went to."""
         bind = self.pick_bind(agent, peer)
         if not bind:
-            return False
+            return None
         bind.deliver(text=text, peer=peer, message_id=message_id, context_token=context_token)
         self._persist()
         self._log(f"virtual: -> {bind.bind_id} {text[:60]!r}")
-        return True
+        return bind
+
+    def served_peers(self, bind: VirtualBind) -> set:
+        """Chats this device has handled (for the memory API's peer check)."""
+        peers = set(bind.context_tokens)
+        if bind.last_peer:
+            peers.add(bind.last_peer)
+        with self._lock:
+            for peer, bind_id in self._peer_bind.items():
+                if bind_id == bind.bind_id:
+                    peers.add(peer)
+        return peers
 
     def wait_for_bind(self, name: str, timeout: float = 120.0) -> Optional[VirtualBind]:
         deadline = time.monotonic() + timeout
@@ -844,6 +860,18 @@ def _make_handler(server: VirtualILinkServer):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if path.startswith("/memory/"):
+                # 记忆检索/统计：GET 也能用（参数在 query 里）
+                bind = server._bind_for_token(self._token())
+                if not bind or not bind.confirmed:
+                    self._send({"ret": ERR_SESSION_EXPIRED, "errmsg": "需要虚拟身份的 token"},
+                               status=401)
+                    return
+                if not server.on_memory:
+                    self._send({"ret": ERR_BAD_REQUEST, "errmsg": "memory is disabled"}, status=404)
+                    return
+                self._send(server.on_memory(bind, path[len("/memory/"):], dict(params)))
+                return
             if path == "/agent/stop":
                 # What the client asks every couple of seconds while a run is in
                 # flight: "有没有人喊停？" — one answer per request.
@@ -924,6 +952,18 @@ def _make_handler(server: VirtualILinkServer):
                 return
 
             payload = self._json_body()
+
+            if path.startswith("/memory/"):
+                bind = server._bind_for_token(self._token())
+                if not bind or not bind.confirmed:
+                    self._send({"ret": ERR_SESSION_EXPIRED, "errmsg": "需要虚拟身份的 token"},
+                               status=401)
+                    return
+                if not server.on_memory:
+                    self._send({"ret": ERR_BAD_REQUEST, "errmsg": "memory is disabled"}, status=404)
+                    return
+                self._send(server.on_memory(bind, path[len("/memory/"):], payload))
+                return
 
             if path == "/ilink/bot/get_bot_qrcode":
                 self._send(server.ep_qrcode())

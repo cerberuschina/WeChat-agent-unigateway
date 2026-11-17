@@ -241,7 +241,8 @@ docs/DASHBOARD.md           控制台：看状态、批准接入（本机网页�
 docs/APPROVALS.md           放行卡：agent 在手机上问一句「可以吗」，沉默=拒绝
 docs/REMOTE-AGENTS.md       非本机 agent 接入：bind_key、上传/下载、安全边界、同一 agent 多设备
 docs/DEPLOY-CLOUD.md        云主机 + 多设备统一网关：Tailscale / WireGuard / ssh 隧道，compose
-docs/MEMORY-DESIGN.md       统一记忆设计稿：L0-L3、联系人/全局层、注入 + 检索 API、可换 TencentDB-Agent-Memory
+docs/MEMORY.md              统一记忆（已实现）：自动记录、每消息注入、/remember 等命令、检索 API
+docs/MEMORY-DESIGN.md       统一记忆设计稿：L0-L3、联系人/全局层、TencentDB-Agent-Memory 后端
 docs/PROTOCOL.md            iLink 协议实测要点
 docs/BACKENDS-WORKBUDDY.md  WorkBuddy 实测结论 + 两条接法
 docs/JOIN.md               一键接入：每种 agent 一条命令、改了什么、怎么排错
@@ -259,6 +260,11 @@ tests/             326 项离线测试
 - [x] 虚拟身份落盘：绑定（身份 + token + 游标 + context_token）写进 `data/virtual/binds.json`，
       网关重启后 agent 不用重扫，手里的 token 照样认得出它
 - [ ] 开机自启脚本（Windows Startup / systemd unit）
+- [x] 统一记忆 P1：记忆属于聊天，自动记录 L0 对话与 L1 事实、每条消息注入摘要、
+      `/remember` `/task` `/recall` `/forget` `/memory`、agent 检索 API、联系人隔离 +
+      全局公共层、Markdown 镜像（见 `docs/MEMORY.md`）
+- [ ] 统一记忆 P2：embedding/RAG、MCP 工具、控制台记忆面板、LLM 事实抽取
+- [ ] 统一记忆 P3：TencentDB-Agent-Memory 后端
 - [x] 云主机 + 多设备：一台网关持微信身份，多台机器的 `hermes` / `claude` / `workbuddy`
       通过 Tailscale / WireGuard / SSH 隧道接入，同一 agent 多实例按聊天粘住并故障转移
       （见 `docs/DEPLOY-CLOUD.md`，Dockerfile / `docker-compose.cloud.yml` /

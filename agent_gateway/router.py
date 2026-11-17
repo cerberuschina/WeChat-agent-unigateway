@@ -26,7 +26,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 COMMANDS = ("help", "agents", "who", "use", "new", "reset", "sessions", "resume", "ping",
-            "approve", "reject", "always", "stop", "queue", "ilink")
+            "approve", "reject", "always", "stop", "queue", "ilink",
+            "remember", "recall", "forget", "memory", "task")
 
 
 @dataclass
@@ -93,6 +94,10 @@ def help_text(cfg, sticky: Optional[str]) -> str:
         "/stop → 让正在跑的 agent 停下来（它几秒内会收到）",
         "/queue <内容> → 这条排在正在跑的活后面，不打断它",
         "/ilink（或只发「保活」）→ 通道保活：网关自己回一句，不打扰 agent",
+        "/remember [--global] 内容 → 记成长期事实；带 --global 是所有人可见的公共层",
+        "/task 内容 ｜ /task done ｜ /task blocked → 记任务、标完成或卡住",
+        "/recall 关键词 → 从记忆里找；/forget id 或关键词 → 删掉",
+        "/memory → 记忆概览；/memory reload → 把 Markdown 里手改的内容导回来",
         "/agents 看名单　/who 看当前　/help 看这条",
         "",
         "名单：",
@@ -189,6 +194,20 @@ def route(text: str, cfg, *, sticky: Optional[str] = None) -> Decision:
             # "这一轮别再问我了" —— 一次把本轮剩下的问题全放行。
             # 它是**明确说的**（不是沉默），但仍然有期限，见 approvals.allow_all。
             return Decision("always", note="approval:always")
+
+        if name in ("remember", "recall", "forget", "memory", "task"):
+            payload = rest.strip()
+            global_ = False
+            if name == "remember":
+                lowered = payload.lower()
+                for flag in ("--global ", "-g "):
+                    if lowered.startswith(flag):
+                        global_, payload = True, payload[len(flag):].strip()
+                        break
+                if payload == "--global" or payload == "-g":
+                    global_, payload = True, ""
+            return Decision(name, text=payload, note=f"memory:{name}",
+                            metadata={"global": global_})
 
         # not a command -> maybe an agent prefix ("/c fix the test")
         agent = cfg.agent_for_prefix(name)
