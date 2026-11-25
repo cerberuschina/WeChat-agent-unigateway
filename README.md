@@ -210,6 +210,27 @@ python -m agent_gateway --config gateway.json
 `cooldown` 防止坏命令被每条消息重试。叫不醒时这条消息会从队列撤回并立刻回一条明确失败——
 不留着等 agent 以后无人值守地跑一遍（那样的回答也没有人收）。
 
+### 多个真实微信号
+
+一个网关进程可以同时长轮询多个真实 iLink 号：
+
+```jsonc
+"accounts": [
+  { "name": "main", "account_id": "…", "token": "…" },          // 第一项 = 主号
+  { "name": "work", "account_id": "…", "token": "…",
+    "allowed_users": [] }                                        // 不填就用全局白名单
+],
+"accounts_mode": "shared"    // shared（默认）= 视作同一个用户；separate = 每个号各自独立
+```
+
+- `shared`：各号的消息**视作同一个用户**——粘住的 agent、消息预算、记忆、`/new` 共用；
+  回复从用户最后说话的那个号发出。只有一个号时行为与以前完全一致（每个聊天仍是独立的用户）。
+- `separate`：内部按 `号|聊天` 区分会话，互不混合。
+- 每个号有自己的长轮询、游标和 context_token：主号沿用 `data/ilink/`，其余在
+  `data/ilink/<name>/`；凭证主号读 `data/account.json`，其余读
+  `data/accounts/<name>.json`（`python -m agent_gateway --login --account work`）。
+- 某个号会话失效（ret=-14）只停它自己的轮询，其他号继续；轮询日志会带账号名。
+
 ### 三种后端
 
 | type | 用途 | 必填 |
@@ -274,6 +295,7 @@ docs/DASHBOARD.md           控制台：看状态、批准接入（本机网页�
 docs/APPROVALS.md           放行卡：agent 在手机上问一句「可以吗」，沉默=拒绝
 docs/REMOTE-AGENTS.md       非本机 agent 接入：bind_key、上传/下载、安全边界、同一 agent 多设备
 docs/DEPLOY-CLOUD.md        云主机 + 多设备统一网关：Tailscale / WireGuard / ssh 隧道，compose
+skills/wechat-agent-gateway-install/   Agent skill（可上架 Agensi）：从 GitHub 安装、验证、接 agent、排错
 docs/MEMORY.md              统一记忆（已实现）：自动记录、每消息注入、/remember 等命令、检索 API
 docs/MEMORY-DESIGN.md       统一记忆设计稿：L0-L3、联系人/全局层、TencentDB-Agent-Memory 后端
 docs/PROTOCOL.md            iLink 协议实测要点
